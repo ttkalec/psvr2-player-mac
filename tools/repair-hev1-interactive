@@ -1,0 +1,188 @@
+#!/bin/zsh
+# Interactively repair HEVC files tagged as hev1.
+#
+# Files whose codec parameters are already present in the track header are
+# retagged in place. Other files are remuxed to a temporary file, verified,
+# and then replaced atomically. No backup copy is retained.
+#
+# Usage:
+#   repair-hev1-interactive <file-or-folder> [more files or folders...]
+
+set -u
+
+script_dir=${0:A:h}
+
+if (( $# == 0 )); then
+	echo "Usage: $0 <file-or-folder> [more files or folders...]" >&2
+	exit 1
+fi
+
+for command in ffmpeg ffprobe python3; do
+	if ! command -v "$command" >/dev/null; then
+		echo "$command is required." >&2
+		exit 1
+	fi
+done
+
+typeset -a candidates
+for input_path in "$@"; do
+	if [[ -d "$input_path" ]]; then
+		candidates+=("$input_path"/**/*.(mp4|mov|m4v)(N))
+	elif [[ -f "$input_path" ]]; then
+		candidates+=("$input_path")
+	else
+		echo "Skipping missing path: $input_path" >&2
+	fi
+done
+
+typeset -a files
+for file in "${candidates[@]}"; do
+	tag=$(ffprobe -v error -select_streams v:0 \
+		-show_entries stream=codec_tag_string -of default=nw=1:nk=1 \
+		"$file" 2>/dev/null)
+	[[ "$tag" == "hev1" ]] && files+=("$file")
+done
+
+if (( ${#files[@]} == 0 )); then
+	echo "No hev1 videos found."
+	exit 0
+fi
+
+echo "Found ${#files[@]} hev1 video(s)."
+echo "Only files you approve will be changed. No backup copy will be kept."
+
+current_tmp=""
+cleanup() {
+	if [[ -n "$current_tmp" && -f "$current_tmp" ]]; then
+		rm -f -- "$current_tmp"
+	fi
+}
+trap cleanup EXIT
+
+remux_with_progress() {
+	local source=$1
+	local destination=$2
+	local duration duration_us key value percent
+	local -a statuses
+
+	duration=$(ffprobe -v error -show_entries format=duration \
+		-of default=nw=1:nk=1 "$source" 2>/dev/null)
+	duration_us=$(awk -v seconds="$duration" \
+		'BEGIN { if (seconds > 0) printf "%.0f", seconds * 1000000 }')
+
+	if [[ -z "$duration_us" || "$duration_us" -le 0 ]]; then
+		echo "Could not read the duration; ffmpeg will show its normal progress."
+		ffmpeg -v error -stats -i "$source" -map 0 -map_metadata 0 \
+			-map_chapters 0 -c copy -tag:v:0 hvc1 -movflags +faststart \
+			"$destination"
+		return $?
+	fi
+
+	printf '  Remuxing:   0%%'
+	ffmpeg -v error -nostats -progress pipe:1 -i "$source" \
+		-map 0 -map_metadata 0 -map_chapters 0 -c copy -tag:v:0 hvc1 \
+		-movflags +faststart "$destination" |
+	while IFS='=' read -r key value; do
+		case "$key" in
+			out_time_us)
+				if [[ "$value" == <-> ]]; then
+					percent=$(( value * 100 / duration_us ))
+					# Reserve 100% for ffmpeg's finalization and faststart pass.
+					(( percent > 99 )) && percent=99
+					printf '\r  Remuxing: %3d%%' "$percent"
+				fi
+				;;
+			progress)
+				[[ "$value" == "end" ]] && printf '\r  Remuxing: 100%%'
+				;;
+		esac
+	done
+	statuses=("${pipestatus[@]}")
+	printf '\n'
+	return ${statuses[1]}
+}
+
+repaired=0
+skipped=0
+
+for file in "${files[@]}"; do
+	size=$(du -h "$file" | cut -f1)
+	check=$("$script_dir/tag-hvc1" -n "$file" 2>&1)
+	if [[ "$check" == *": can be fixed ("* ]]; then
+		method="instant in-place tag repair"
+	else
+		method="remux, verify, then replace original"
+	fi
+
+	echo
+	echo "$file"
+	echo "Size: $size"
+	echo "Method: $method"
+	read -r "answer?Repair this file? [y/N/q] "
+
+	case "${answer:l}" in
+		q|quit)
+			echo "Stopped."
+			break
+			;;
+		y|yes)
+			;;
+		*)
+			(( skipped++ ))
+			continue
+			;;
+	esac
+
+	if [[ "$method" == "instant in-place tag repair" ]]; then
+		if "$script_dir/tag-hvc1" "$file"; then
+			new_tag=$(ffprobe -v error -select_streams v:0 \
+				-show_entries stream=codec_tag_string -of default=nw=1:nk=1 \
+				"$file" 2>/dev/null)
+			if [[ "$new_tag" == "hvc1" ]]; then
+				(( repaired++ ))
+			else
+				echo "Verification failed. Reverting the tag." >&2
+				"$script_dir/tag-hvc1" -r "$file" >/dev/null
+			fi
+		else
+			echo "Repair failed. The file was not changed." >&2
+		fi
+		continue
+	fi
+
+	# Keep the temporary file beside the original so the final rename is
+	# atomic. This needs temporary free space about equal to the input size.
+	current_tmp="${file:r}.hev1-repairing-$$.${file:e}"
+	if [[ -e "$current_tmp" ]]; then
+		echo "Temporary path already exists: $current_tmp" >&2
+		current_tmp=""
+		continue
+	fi
+
+	if remux_with_progress "$file" "$current_tmp"; then
+		new_tag=$(ffprobe -v error -select_streams v:0 \
+			-show_entries stream=codec_tag_string -of default=nw=1:nk=1 \
+			"$current_tmp" 2>/dev/null)
+		if [[ "$new_tag" == "hvc1" ]]; then
+			mode=$(stat -f '%Lp' "$file")
+			chmod "$mode" "$current_tmp"
+			touch -r "$file" "$current_tmp"
+			mv -f -- "$current_tmp" "$file"
+			current_tmp=""
+			(( repaired++ ))
+			echo "Repaired and replaced: $file"
+		else
+			echo "Verification failed. The original was kept." >&2
+			rm -f -- "$current_tmp"
+			current_tmp=""
+		fi
+	else
+		echo "Remux failed. The original was kept." >&2
+		rm -f -- "$current_tmp"
+		current_tmp=""
+	fi
+done
+
+echo
+echo "Repaired: $repaired"
+echo "Skipped: $skipped"
