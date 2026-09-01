@@ -1286,6 +1286,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
 final class PlayerView: MTKView {
     var renderer: Renderer?
+    private var seekRequestID = 0
 
     override var acceptsFirstResponder: Bool { true }
     // Clicks on the non-key headset window (the key window is the remote on the monitor)
@@ -1410,7 +1411,41 @@ final class PlayerView: MTKView {
     private func seek(by seconds: Double) {
         guard let p = renderer?.video?.player else { return }
         let target = CMTimeAdd(p.currentTime(), CMTime(seconds: seconds, preferredTimescale: 600))
-        p.seek(to: target, toleranceBefore: .zero, toleranceAfter: .positiveInfinity)
+        seek(to: target)
+    }
+
+    private func seek(to requestedTime: CMTime) {
+        guard let r = renderer, let p = r.video?.player,
+              let item = p.currentItem else { return }
+
+        let duration = item.duration
+        var target = requestedTime
+        if duration.isNumeric {
+            target = CMTimeMaximum(.zero, CMTimeMinimum(requestedTime, duration))
+        }
+
+        // A new slider movement supersedes an older NAS request. A small,
+        // symmetric tolerance lets AVFoundation use a nearby keyframe instead
+        // of fetching and decoding forward from an exact earlier sample.
+        seekRequestID += 1
+        let requestID = seekRequestID
+        item.cancelPendingSeeks()
+        let tolerance = CMTime(seconds: 2, preferredTimescale: 600)
+        let targetSeconds = max(0, target.seconds.isFinite ? target.seconds : 0)
+        let wholeSeconds = Int(targetSeconds.rounded())
+        let targetText = wholeSeconds >= 3600
+            ? String(format: "%d:%02d:%02d", wholeSeconds / 3600,
+                     (wholeSeconds / 60) % 60, wholeSeconds % 60)
+            : String(format: "%d:%02d", wholeSeconds / 60, wholeSeconds % 60)
+        r.overlay?.showOSD("Seeking to \(targetText)…")
+
+        p.seek(to: target, toleranceBefore: tolerance, toleranceAfter: tolerance) {
+            [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self, self.seekRequestID == requestID else { return }
+                self.renderer?.overlay?.seekCompleted()
+            }
+        }
     }
 
     private func togglePause() {
@@ -1501,9 +1536,12 @@ final class PlayerView: MTKView {
         case .cycleStereo: cycleStereo()
         case .seekFraction(let f):
             guard let p = r.video?.player, let item = p.currentItem,
-                  item.duration.isNumeric else { break }
+                  item.duration.isNumeric else {
+                r.overlay?.seekCompleted()
+                break
+            }
             let target = CMTime(seconds: item.duration.seconds * f, preferredTimescale: 600)
-            p.seek(to: target, toleranceBefore: .zero, toleranceAfter: .positiveInfinity)
+            seek(to: target)
             print("[player] seek to \(Int(item.duration.seconds * f)) s")
         }
     }
@@ -1514,6 +1552,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var renderer: Renderer!
     var keyMonitor: Any?
     var cvLink: CVDisplayLink?
+    // CVDisplayLink runs independently of the main thread. Never queue more
+    // than one draw or input events can sit behind hundreds of stale frames.
+    private let displayLinkLock = NSLock()
+    private var displayLinkDrawPending = false
     var headsetDisplayID: CGDirectDisplayID = 0
     // No headset display at launch — rendering to a window on the monitor
     var runningInPreview = false
@@ -1705,8 +1747,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         CVDisplayLinkCreateWithCGDisplay(displayID, &linkOut)
         if let link = linkOut {
             CVDisplayLinkSetOutputHandler(link) { [weak self] _, _, _, _, _ in
+                guard let self else { return kCVReturnSuccess }
+                self.displayLinkLock.lock()
+                let shouldSchedule = !self.displayLinkDrawPending
+                if shouldSchedule {
+                    self.displayLinkDrawPending = true
+                }
+                self.displayLinkLock.unlock()
+                guard shouldSchedule else { return kCVReturnSuccess }
+
                 DispatchQueue.main.async {
-                    self?.playerView?.draw()
+                    self.playerView?.draw()
+                    self.displayLinkLock.lock()
+                    self.displayLinkDrawPending = false
+                    self.displayLinkLock.unlock()
                 }
                 return kCVReturnSuccess
             }

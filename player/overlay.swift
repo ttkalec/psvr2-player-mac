@@ -119,6 +119,9 @@ final class UIOverlay {
     // the target fraction; the seek itself runs on release
     private var scrubbing = false
     private var scrubFraction = 0.0
+    // Keep showing the requested position while AVPlayer fetches data from a
+    // slow disk or NAS. Without this, the knob snaps back until seeking ends.
+    private var pendingSeekFraction: Double?
 
     // Popup indicator (e.g. volume): shown even without the panel
     private var osdText: String?
@@ -247,6 +250,7 @@ final class UIOverlay {
     // File opened from a command-line argument
     func setCurrentFile(_ url: URL) {
         currentFile = url
+        pendingSeekFraction = nil
     }
 
     func openPicker(startDir: URL? = nil) {
@@ -691,9 +695,15 @@ final class UIOverlay {
     func mouseUp() -> UIAction? {
         guard scrubbing else { return nil }
         scrubbing = false
+        pendingSeekFraction = scrubFraction
         markActivity()
         redrawSoon()
         return .seekFraction(scrubFraction)
+    }
+
+    func seekCompleted() {
+        pendingSeekFraction = nil
+        redrawSoon()
     }
 
     func markActivity() {
@@ -830,7 +840,8 @@ final class UIOverlay {
         let current = player.currentTime().seconds
         let played = scrubbing
             ? scrubFraction
-            : max(0, min(1, (current.isFinite ? current : 0) / dur))
+            : pendingSeekFraction
+                ?? max(0, min(1, (current.isFinite ? current : 0) / dur))
 
         if played > 0 {
             let fill = CGRect(x: track.minX, y: track.minY,
