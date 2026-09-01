@@ -59,11 +59,62 @@ cleanup() {
 }
 trap cleanup EXIT
 
+moov_reserve_bytes() {
+	python3 - "$1" <<'PY'
+import os
+import struct
+import sys
+
+path = sys.argv[1]
+with open(path, "rb") as fh:
+    file_size = os.fstat(fh.fileno()).st_size
+    pos = 0
+    while pos + 8 <= file_size:
+        fh.seek(pos)
+        header = fh.read(8)
+        if len(header) != 8:
+            break
+        atom_size, atom_type = struct.unpack(">I4s", header)
+        header_size = 8
+        if atom_size == 1:
+            extended = fh.read(8)
+            if len(extended) != 8:
+                break
+            atom_size = struct.unpack(">Q", extended)[0]
+            header_size = 16
+        elif atom_size == 0:
+            atom_size = file_size - pos
+        if atom_size < header_size or pos + atom_size > file_size:
+            break
+        if atom_type == b"moov":
+            # Remuxed sample tables are normally about the same size as the
+            # source. Keep at least 8 MiB and 25% extra, rounded to a MiB.
+            margin = max(8 * 1024 * 1024, atom_size // 4)
+            reserve = atom_size + margin
+            reserve = ((reserve + 1024 * 1024 - 1) // (1024 * 1024)) * 1024 * 1024
+            if reserve <= 2_147_483_647:  # ffmpeg's -moov_size limit
+                print(reserve)
+            break
+        pos += atom_size
+PY
+}
+
 remux_with_progress() {
 	local source=$1
 	local destination=$2
-	local duration duration_us key value percent
+	local duration duration_us key value percent moov_reserve
 	local -a statuses
+	local -a layout_options
+
+	moov_reserve=$(moov_reserve_bytes "$source" 2>/dev/null)
+	if [[ "$moov_reserve" == <-> && "$moov_reserve" -gt 0 ]]; then
+		# Reserving the header up front avoids faststart's unreported second
+		# pass, which otherwise rewrites the entire file after reaching 99%.
+		layout_options=(-moov_size "$moov_reserve")
+	else
+		layout_options=(-movflags +faststart)
+		echo "Could not size the MP4 header; final faststart processing has no percentage."
+	fi
 
 	duration=$(ffprobe -v error -show_entries format=duration \
 		-of default=nw=1:nk=1 "$source" 2>/dev/null)
@@ -73,7 +124,7 @@ remux_with_progress() {
 	if [[ -z "$duration_us" || "$duration_us" -le 0 ]]; then
 		echo "Could not read the duration; ffmpeg will show its normal progress."
 		ffmpeg -v error -stats -i "$source" -map 0 -map_metadata 0 \
-			-map_chapters 0 -c copy -tag:v:0 hvc1 -movflags +faststart \
+			-map_chapters 0 -c copy -tag:v:0 hvc1 "${layout_options[@]}" \
 			"$destination"
 		return $?
 	fi
@@ -81,7 +132,7 @@ remux_with_progress() {
 	printf '  Remuxing:   0%%'
 	ffmpeg -v error -nostats -progress pipe:1 -i "$source" \
 		-map 0 -map_metadata 0 -map_chapters 0 -c copy -tag:v:0 hvc1 \
-		-movflags +faststart "$destination" |
+		"${layout_options[@]}" "$destination" |
 	while IFS='=' read -r key value; do
 		case "$key" in
 			out_time_us)
