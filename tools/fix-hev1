@@ -77,7 +77,8 @@ for f in "${files[@]}"; do
 	fi
 
 	echo "→ ${f:t} → ${out:t}"
-	if ffmpeg -v error -stats -i "$f" -map 0 -c copy -tag:v hvc1 \
+	if ffmpeg -v error -stats -i "$f" -map 0 -c copy \
+		-bsf:v:0 hevc_mp4toannexb,extract_extradata -tag:v:0 hvc1 \
 		-movflags +faststart "$out"; then
 		echo "  done"
 	else

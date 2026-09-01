@@ -124,14 +124,17 @@ remux_with_progress() {
 	if [[ -z "$duration_us" || "$duration_us" -le 0 ]]; then
 		echo "Could not read the duration; ffmpeg will show its normal progress."
 		ffmpeg -v error -stats -i "$source" -map 0 -map_metadata 0 \
-			-map_chapters 0 -c copy -tag:v:0 hvc1 "${layout_options[@]}" \
+			-map_chapters 0 -c copy \
+			-bsf:v:0 hevc_mp4toannexb,extract_extradata -tag:v:0 hvc1 \
+			"${layout_options[@]}" \
 			"$destination"
 		return $?
 	fi
 
 	printf '  Remuxing:   0%%'
 	ffmpeg -v error -nostats -progress pipe:1 -i "$source" \
-		-map 0 -map_metadata 0 -map_chapters 0 -c copy -tag:v:0 hvc1 \
+		-map 0 -map_metadata 0 -map_chapters 0 -c copy \
+		-bsf:v:0 hevc_mp4toannexb,extract_extradata -tag:v:0 hvc1 \
 		"${layout_options[@]}" "$destination" |
 	while IFS='=' read -r key value; do
 		case "$key" in
