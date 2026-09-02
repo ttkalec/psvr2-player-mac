@@ -1373,7 +1373,7 @@ final class PlayerView: MTKView {
         switch event.keyCode {
         case 12, 53: // Q, Esc
             print("[player] quit")
-            r.overlay?.hide() // restore the system cursor
+            r.overlay?.hide(releaseCapture: true) // restore the system cursor
             r.video?.savePosition()
             r.video?.player.pause()
             psvr2_stop()
@@ -2180,7 +2180,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         renderer?.video?.savePosition()
-        renderer?.overlay?.hide()
+        renderer?.overlay?.hide(releaseCapture: true)
         if let link = cvLink {
             CVDisplayLinkStop(link)
         }

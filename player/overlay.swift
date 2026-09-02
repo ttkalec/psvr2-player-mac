@@ -2,9 +2,9 @@
 //
 // Appears on mouse movement (while the app is active): the real cursor is
 // captured (hidden and frozen over the headset window) and its deltas move a
-// virtual cursor over the panel. After 3 s of inactivity the panel hides and
-// the mouse is released. The panel is drawn with CoreGraphics into a texture;
-// the cursor is drawn in the shader.
+// virtual cursor over the panel. After 3 s of inactivity the panel hides;
+// the real cursor stays hidden while viewing a video in the headset. The
+// panel is drawn with CoreGraphics into a texture; its cursor is in the shader.
 //
 // File picker mode: scrollable list of folders and video files; opens
 // automatically when started without an argument, or via the "File…" button.
@@ -360,7 +360,7 @@ final class UIOverlay {
                 if self.releasedForDialog {
                     self.releasedForDialog = false
                     self.onWindowLevelRequest?(true)
-                    self.captureMouse()
+                    self.updateMouseCapture()
                     self.clearOSD() // dialog answered — remove the hint
                 }
                 self.buildPickerButtons()
@@ -458,6 +458,9 @@ final class UIOverlay {
 
     // Called every frame from the render loop
     func tick() {
+        // Also run when the HUD is hidden, so deactivation, video stop, and
+        // passthrough transitions always restore normal desktop mouse control.
+        defer { updateMouseCapture() }
         let (dx, dy) = CGGetLastMouseDelta()
         let moved = dx != 0 || dy != 0
         // While the right button is held, the mouse rotates the scene: don't
@@ -576,8 +579,18 @@ final class UIOverlay {
         hmdWorn = worn
         if !worn {
             hide() // hides the panel and releases the mouse
-        } else if active {
+        } else {
+            updateMouseCapture()
+        }
+    }
+
+    private func updateMouseCapture() {
+        let viewingVideo = renderer?.video != nil
+        if captureEnabled && hmdWorn && NSApp.isActive && !releasedForDialog
+            && renderer?.passthrough?.active != true && (active || viewingVideo) {
             captureMouse()
+        } else {
+            releaseMouse(restorePosition: !releasedForDialog)
         }
     }
 
@@ -607,20 +620,22 @@ final class UIOverlay {
         cursorU = 0.5
         cursorV = 0.5
         renderer?.anchorPanel() // pin the panel in front of the current gaze
-        captureMouse()
+        updateMouseCapture()
         redraw()
     }
 
-    func hide() {
-        guard active else { return }
+    func hide(releaseCapture: Bool = false) {
         active = false
-        releasedForDialog = false
         // The format submenu doesn't survive hiding the panel
         if mode == .format {
             mode = .controls
             buildControlButtons()
         }
-        releaseMouse()
+        if releaseCapture {
+            releaseMouse()
+        } else {
+            updateMouseCapture()
+        }
     }
 
     private func cursorCGPoint() -> CGPoint {

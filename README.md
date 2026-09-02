@@ -36,7 +36,9 @@ brick) bridges that gap. No software can work around it.
   Fn button — the small button on the underside of the visor, bottom right
   when the headset is on your head
 - Control panel and file picker rendered inside the headset (appears on
-  mouse move, anchored in space); timeline with click and drag seeking
+  mouse move, anchored in space); timeline with click and drag seeking.
+  The system cursor stays hidden over video when the panel fades out;
+  moving the mouse brings the panel and its virtual cursor back.
 - File list with thumbnails, duration and resolution; the player remembers
   where you stopped in every file and resumes from there
 - A "Format" submenu for explicit projection / stereo layout / speed /
