@@ -523,6 +523,8 @@ struct Uniforms {
 
 final class VideoSource {
     let player: AVPlayer
+    let nasAsset: NASVideoAsset?
+    let seeker: VideoSeeker
     private var output: AVPlayerItemVideoOutput
     private var textureCache: CVMetalTextureCache?
     private(set) var textureY: MTLTexture?
@@ -532,11 +534,20 @@ final class VideoSource {
     private(set) var isBGRA = false
     private(set) var audioDeviceID: AudioDeviceID?
     private var endObserver: NSObjectProtocol?
+    private var statusObserver: NSKeyValueObservation?
     let url: URL
     var onUnsupported: ((String) -> Void)?
+    var onBufferingChanged: ((Bool) -> Void)?
+    private(set) var isBuffering = false
     private var loggedFormat = false
     private var noFrameSince = CACurrentMediaTime()
     private var gotAnyFrame = false
+    private var lastFrameTime = CMTime.invalid
+    private var lastFrameHostTime: CFTimeInterval?
+    private var statVideoFrames = 0
+    private var statMaxFrameGap = 0.0
+    private var statMaxCopyTime = 0.0
+    private var statLastReport = CACurrentMediaTime()
     // Not every file delivers frames in the requested format: if no frames
     // arrive, try the other variants in turn
     private var formatAttempt = 0
@@ -581,23 +592,36 @@ final class VideoSource {
 
     init(url: URL, device: MTLDevice) {
         self.url = url
-        let item = AVPlayerItem(url: url)
+        let buffered = NASVideoAsset.isNetworkFile(url) ? NASVideoAsset(url: url) : nil
+        nasAsset = buffered
+        let item = buffered.map { AVPlayerItem(asset: $0.asset) } ?? AVPlayerItem(url: url)
         // Without pitch correction, audio at rates ≠ 1× turns into a squeak
         item.audioTimePitchAlgorithm = .timeDomain
         output = Self.makeOutput(attempt: 0)
         item.add(output)
         player = AVPlayer(playerItem: item)
+        seeker = VideoSeeker(player: player) { [weak buffered] in buffered?.prepareForSeek() }
+        player.automaticallyWaitsToMinimizeStalling = true
         player.actionAtItemEnd = .pause
         CVMetalTextureCacheCreate(nil, nil, device, nil, &textureCache)
 
         // At end of file — stop and rewind to the start (no looping);
         // "Play" will start from the beginning
         describeTracks(item.asset)
+        statusObserver = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+            guard item.status == .failed else { return }
+            let message = item.error?.localizedDescription ?? "Unknown playback error"
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.player.currentItem === item else { return }
+                print("[video] Playback failed: \(message)")
+                self.onUnsupported?("Video could not be loaded (see log)")
+            }
+        }
 
         endObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
         ) { [weak self] _ in
-            self?.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
+            self?.seeker.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
             print("[player] end of file")
             if let self {
                 ResumeStore.set(nil, for: self.url) // watched to the end — restart
@@ -686,7 +710,14 @@ final class VideoSource {
         saveTimer?.invalidate()
         saveTimer = nil
         player.pause()
+        seeker.stop()
+        if isBuffering {
+            isBuffering = false
+            onBufferingChanged?(false)
+        }
         player.replaceCurrentItem(with: nil)
+        statusObserver = nil
+        nasAsset?.stop()
         if let endObserver {
             NotificationCenter.default.removeObserver(endObserver)
             self.endObserver = nil
@@ -824,10 +855,34 @@ final class VideoSource {
     }
 
     func updateTexture() {
-        let t = output.itemTime(forHostTime: CACurrentMediaTime())
+        let now = CACurrentMediaTime()
+        let t = output.itemTime(forHostTime: now)
+        var displayTime = CMTime.invalid
+        let copyStart = CACurrentMediaTime()
         // No hasNewPixelBuffer check: some files deliver frames without
         // reporting them via that flag
-        guard let pb = output.copyPixelBuffer(forItemTime: t, itemTimeForDisplay: nil),
+        let pixelBuffer = output.copyPixelBuffer(forItemTime: t, itemTimeForDisplay: &displayTime)
+        statMaxCopyTime = max(statMaxCopyTime, CACurrentMediaTime() - copyStart)
+        let playing = player.timeControlStatus == .playing
+        if playing, let last = lastFrameHostTime {
+            statMaxFrameGap = max(statMaxFrameGap, now - last)
+        }
+        if pixelBuffer != nil, displayTime.isNumeric, displayTime != lastFrameTime {
+            statVideoFrames += 1
+            lastFrameTime = displayTime
+            lastFrameHostTime = now
+        } else if !playing {
+            lastFrameHostTime = nil
+        }
+        let buffering = nasAsset != nil && player.rate != 0 && player.currentItem?.status != .failed
+            && (player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+                || now - (lastFrameHostTime ?? noFrameSince) > 0.4)
+        if buffering != isBuffering {
+            isBuffering = buffering
+            onBufferingChanged?(buffering)
+        }
+        reportPlaybackStats(now: now)
+        guard let pb = pixelBuffer,
               let cache = textureCache else {
             retryOtherFormatIfNeeded()
             return
@@ -878,6 +933,26 @@ final class VideoSource {
         }
     }
 
+    private func reportPlaybackStats(now: CFTimeInterval) {
+        let elapsed = now - statLastReport
+        guard elapsed >= 2 else { return }
+        let state: String
+        switch player.timeControlStatus {
+        case .paused: state = "paused"
+        case .waitingToPlayAtSpecifiedRate: state = "waiting"
+        case .playing: state = "playing"
+        @unknown default: state = "unknown"
+        }
+        let reason = player.reasonForWaitingToPlay?.rawValue ?? "none"
+        print(String(format: "[playback] videoFPS=%.1f maxGap=%.0fms copyMax=%.1fms position=%.2fs state=%@ reason=%@",
+                     Double(statVideoFrames) / elapsed, statMaxFrameGap * 1000,
+                     statMaxCopyTime * 1000, player.currentTime().seconds, state, reason))
+        statVideoFrames = 0
+        statMaxFrameGap = 0
+        statMaxCopyTime = 0
+        statLastReport = now
+    }
+
     private func makeTexture(_ pb: CVPixelBuffer, cache: CVMetalTextureCache,
                              plane: Int, format: MTLPixelFormat) -> MTLTexture? {
         let w = CVPixelBufferGetWidthOfPlane(pb, plane)
@@ -895,6 +970,7 @@ final class VideoSource {
     // No frames — try the next pixel format
     private func retryOtherFormatIfNeeded() {
         guard !gotAnyFrame, player.rate != 0,
+              player.timeControlStatus == .playing,
               CACurrentMediaTime() - noFrameSince > 2,
               let item = player.currentItem else { return }
         noFrameSince = CACurrentMediaTime()
@@ -1409,13 +1485,15 @@ final class PlayerView: MTKView {
     }
 
     private func seek(by seconds: Double) {
-        guard let p = renderer?.video?.player else { return }
-        let target = CMTimeAdd(p.currentTime(), CMTime(seconds: seconds, preferredTimescale: 600))
+        guard let video = renderer?.video else { return }
+        let base = video.seeker.target ?? video.player.currentTime()
+        let target = CMTimeAdd(base, CMTime(seconds: seconds, preferredTimescale: 600))
         seek(to: target)
     }
 
     private func seek(to requestedTime: CMTime) {
-        guard let r = renderer, let p = r.video?.player,
+        guard let r = renderer, let video = r.video,
+              let p = r.video?.player,
               let item = p.currentItem else { return }
 
         let duration = item.duration
@@ -1424,12 +1502,11 @@ final class PlayerView: MTKView {
             target = CMTimeMaximum(.zero, CMTimeMinimum(requestedTime, duration))
         }
 
-        // A new slider movement supersedes an older NAS request. A small,
+        // A new slider movement replaces the queued target. A small,
         // symmetric tolerance lets AVFoundation use a nearby keyframe instead
         // of fetching and decoding forward from an exact earlier sample.
         seekRequestID += 1
         let requestID = seekRequestID
-        item.cancelPendingSeeks()
         let tolerance = CMTime(seconds: 2, preferredTimescale: 600)
         let targetSeconds = max(0, target.seconds.isFinite ? target.seconds : 0)
         let wholeSeconds = Int(targetSeconds.rounded())
@@ -1438,11 +1515,16 @@ final class PlayerView: MTKView {
                      (wholeSeconds / 60) % 60, wholeSeconds % 60)
             : String(format: "%d:%02d", wholeSeconds / 60, wholeSeconds % 60)
         r.overlay?.showOSD("Seeking to \(targetText)…")
+        let seekStarted = CACurrentMediaTime()
+        print(String(format: "[playback] seek #%d requested=%.2fs", requestID, targetSeconds))
 
-        p.seek(to: target, toleranceBefore: tolerance, toleranceAfter: tolerance) {
-            [weak self] _ in
+        video.seeker.seek(to: target, toleranceBefore: tolerance, toleranceAfter: tolerance) {
+            [weak self, weak video] finished in
             DispatchQueue.main.async {
-                guard let self, self.seekRequestID == requestID else { return }
+                guard let self, let video, self.renderer?.video === video,
+                      self.seekRequestID == requestID else { return }
+                print(String(format: "[playback] seek #%d finished=%@ elapsed=%.0fms",
+                             requestID, String(finished), (CACurrentMediaTime() - seekStarted) * 1000))
                 self.renderer?.overlay?.seekCompleted()
             }
         }
@@ -1922,7 +2004,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 pos = Self.timeText(v.player.currentTime().seconds)
                 dur = Self.timeText(item.duration.seconds)
             }
-            set("pos", "\(pos) / \(dur) · \(v.player.rate == 0 ? "paused" : "playing")")
+            let state = v.isBuffering ? "buffering" : (v.player.rate == 0 ? "paused" : "playing")
+            set("pos", "\(pos) / \(dur) · \(state)")
             set("vol", v.deviceVolume().map { "\(Int($0 * 100))% (headset)" }
                 ?? "\(Int(v.player.volume * 100))%")
         } else {
@@ -2054,6 +2137,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let renderer else { return }
         renderer.video?.stop()
         let vs = VideoSource(url: url, device: renderer.device)
+        vs.onBufferingChanged = { [weak renderer, weak vs] buffering in
+            guard let renderer, let vs, renderer.video === vs,
+                  renderer.passthrough?.active != true else { return }
+            if buffering {
+                renderer.overlay?.showOSD("Buffering from NAS…", duration: 3600)
+            } else {
+                renderer.overlay?.clearOSD(matching: "Buffering from NAS…")
+            }
+        }
         vs.onUnsupported = { [weak renderer] message in
             renderer?.overlay?.showOSD(message, duration: 8)
         }
@@ -2069,7 +2161,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Resume from the last position if the file was watched before
         if let resume = ResumeStore.position(for: url), resume > 15 {
-            vs.player.seek(to: CMTime(seconds: resume, preferredTimescale: 600),
+            vs.seeker.seek(to: CMTime(seconds: resume, preferredTimescale: 600),
                            toleranceBefore: .zero, toleranceAfter: .positiveInfinity)
             let s = Int(resume)
             let ts = s >= 3600

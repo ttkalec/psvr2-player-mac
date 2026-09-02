@@ -111,6 +111,36 @@ player/play "video_180_SBS.mp4"
 log goes to `~/Library/Logs/PSVR2Player.log` (watch with `tail -f` or
 Console.app).
 
+For stuttering, compare `[stat] fps` (headset redraws) with `[playback]
+videoFPS` (distinct video frames delivered). A 60 fps video should deliver
+about 60 new frames per second during steady playback at 1×, even though
+the headset redraws at 120 Hz. `maxGap` records the longest interval without
+a new frame while playing; `copyMax` measures the longest video-output fetch.
+Seek requests and completion times are logged separately. Pausing, starting,
+and seeking can lower the counts in the surrounding two-second report.
+
+Files on mounted network volumes automatically use a 256 MiB RAM cache of
+compressed data. A background reader fetches 2 MiB chunks and reads ahead;
+AVFoundation receives byte ranges through a custom resource loader. The
+original file stays on the NAS, with no remuxing, transcoding, or disk copy.
+The cache is released when the file closes. Local files use the normal path.
+
+Only one decoder seek runs at a time; rapid inputs replace the queued target.
+Seeking prioritizes the new requests and stops scheduling old read-ahead.
+An SMB read already in progress must finish before the next one starts.
+The headset shows "Buffering from NAS…" when video delivery waits, and the
+remote window also reports buffering. A seek can still pause briefly while
+the decoder restarts. `[nas]` logs show cache usage, active read speed, longest
+read, and cache hits/misses. The read speed includes OS-cached reads and is
+not a measurement of physical network throughput. The RAM limit applies to
+the app's compressed-data cache; AVFoundation and rendering use extra memory.
+
+Run `tools/test-nas-buffer` for resource-loader regression checks. It requires
+ffmpeg and generates a temporary test video, compares compressed video/audio
+samples against direct file reading, and checks rapid seeks, pause during a
+seek, EOF, errors, and cleanup. For troubleshooting NAS-specific behavior,
+compare the original file with a local copy.
+
 In macOS Settings, set the "PS VR2" display to 120 Hz.
 
 Keys: `Space` pause · `R`/Fn button on the headset — recenter (long-press Fn
@@ -130,8 +160,9 @@ Debug: `P` pose prediction · `[`/`]` look-ahead · `S` scanline correction ·
 
 - `player/` — the player itself: `main.swift` (AppKit + Metal +
   AVFoundation + the shader), `overlay.swift` (in-headset panel and file
-  picker), `meta.swift` (thumbnail/metadata cache), `sweeper.swift` (moves
-  stray windows off the headset display), `passthrough.swift` (camera frames
+  picker), `nas.swift` (network-file read-ahead), `seeking.swift` (queued seeks),
+  `meta.swift` (thumbnail/metadata cache), `sweeper.swift` (moves stray windows
+  off the headset display), `passthrough.swift` (camera frames
   to BC4 textures), `cpsvr2.c` (SLAM/IMU/status/camera streams over libusb),
   `lut.c` (distortion table from Monado), `environment.jpg` (the space
   panorama shown when nothing is playing)

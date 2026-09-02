@@ -143,6 +143,12 @@ final class UIOverlay {
         redrawSoon()
     }
 
+    // An asynchronous buffering update must not erase a newer user message.
+    func clearOSD(matching text: String) {
+        guard osdText == text else { return }
+        clearOSD()
+    }
+
     func showOSD(_ text: String, duration: Double = 1.5) {
         osdText = text
         osdUntil = CACurrentMediaTime() + duration

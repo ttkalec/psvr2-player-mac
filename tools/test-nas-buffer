@@ -1,0 +1,13 @@
+#!/bin/zsh
+set -eu
+root=${0:A:h:h}
+test_dir=$(mktemp -d /private/tmp/psvr2-nas-tests.XXXXXX)
+trap 'rm -rf "$test_dir"' EXIT
+# Leave moov at the end to exercise non-sequential metadata requests.
+ffmpeg -hide_banner -loglevel error \
+    -f lavfi -i 'testsrc2=size=640x360:rate=30' \
+    -f lavfi -i 'sine=frequency=440:sample_rate=48000' \
+    -t 12 -c:v libx264 -preset ultrafast -crf 10 -g 30 -c:a aac "$test_dir/fixture.mp4"
+swiftc -O "$root/player/nas.swift" "$root/player/seeking.swift" \
+    "$root/tools/nas-buffer-tests.swift" -o "$test_dir/tests"
+"$test_dir/tests" "$test_dir/fixture.mp4"
