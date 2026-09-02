@@ -1360,6 +1360,23 @@ final class Renderer: NSObject, MTKViewDelegate {
 
 // MARK: - Window and keyboard
 
+final class PlayerApplication: NSApplication {
+    var onPlaybackSpace: ((_ isRepeat: Bool) -> Bool)?
+
+    override func sendEvent(_ event: NSEvent) {
+        // Handle Space before key equivalents, controls, and responder-chain
+        // dispatch. A held key must not repeatedly pause and resume playback.
+        let modifiers = event.modifierFlags.intersection([.command, .control, .option])
+        let editingText = (keyWindow?.firstResponder as? NSTextView)?.isEditable == true
+        if event.type == .keyDown, event.keyCode == 49, modifiers.isEmpty,
+           modalWindow == nil, keyWindow?.attachedSheet == nil, !editingText,
+           onPlaybackSpace?(event.isARepeat) == true {
+            return
+        }
+        super.sendEvent(event)
+    }
+}
+
 final class PlayerView: MTKView {
     var renderer: Renderer?
     private var seekRequestID = 0
@@ -1378,8 +1395,6 @@ final class PlayerView: MTKView {
             r.video?.player.pause()
             psvr2_stop()
             exit(0)
-        case 49: // Space
-            togglePause()
         case 15: // R
             r.tracker.requestRecenter()
             print("[player] recenter")
@@ -1530,7 +1545,7 @@ final class PlayerView: MTKView {
         }
     }
 
-    private func togglePause() {
+    func togglePause() {
         guard let r = renderer, let p = r.video?.player else { return }
         if p.rate == 0 {
             p.rate = r.playbackRate
@@ -1753,6 +1768,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         view.isPaused = true
         view.enableSetNeedsDisplay = false
         playerView = view
+        (NSApp as? PlayerApplication)?.onPlaybackSpace = { [weak self] isRepeat in
+            guard let self, self.renderer?.video != nil else { return false }
+            if !isRepeat { self.playerView?.togglePause() }
+            return true
+        }
 
         if vrScreen != nil {
             // The borderless headset window intentionally does NOT become key:
@@ -1781,6 +1801,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Safety net: catch keys at the application level even if the window
         // on the headset display is not focused
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // Space is handled by PlayerApplication before dispatch. Leave
+            // dialogs and text fields their normal Space behavior otherwise.
+            if event.keyCode == 49 { return event }
             view.keyDown(with: event)
             return nil
         }
@@ -2208,7 +2231,7 @@ let args = CommandLine.arguments
 // With no argument, the file is chosen via the in-headset panel after launch
 let url: URL? = args.count > 1 ? URL(fileURLWithPath: args[1]) : nil
 
-let app = NSApplication.shared
+let app = PlayerApplication.shared
 app.setActivationPolicy(.regular)
 let delegate = AppDelegate(videoURL: url)
 app.delegate = delegate

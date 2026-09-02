@@ -126,6 +126,8 @@ compressed data. A background reader fetches 2 MiB chunks and reads ahead;
 AVFoundation receives byte ranges through a custom resource loader. The
 original file stays on the NAS, with no remuxing, transcoding, or disk copy.
 The cache is released when the file closes. Local files use the normal path.
+The loader identifies NAS media as complete, seekable files so AVFoundation
+keeps supplying both audio and video during sustained playback.
 
 Only one decoder seek runs at a time; rapid inputs replace the queued target.
 Seeking prioritizes the new requests and stops scheduling old read-ahead.
@@ -143,9 +145,15 @@ samples against direct file reading, and checks rapid seeks, pause during a
 seek, EOF, errors, and cleanup. For troubleshooting NAS-specific behavior,
 compare the original file with a local copy.
 
+Run `tools/test-audio-playback` for a longer playback check. It creates a
+temporary video of about 700 MB with continuous audio, exceeds the RAM cache,
+and verifies decoded audio and video for 65 seconds. Audio output stays silent
+during this test. It requires ffmpeg and an available macOS audio output.
+
 In macOS Settings, set the "PS VR2" display to 120 Hz.
 
-Keys: `Space` pause · `R`/Fn button on the headset — recenter (long-press Fn
+Keys: `Space` pause/resume, once per press while the app is active ·
+`R`/Fn button on the headset — recenter (long-press Fn
 centers the video on your gaze, handy when lying down; double-press — camera
 view) · `B` camera view (`M` stereo/mono, `,`/`.` convergence) ·
 `F` projection · `G` stereo · `V` vertical flip · `,`/`.` stereo depth (pushes

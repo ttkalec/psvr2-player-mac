@@ -1,0 +1,16 @@
+#!/bin/zsh
+set -eu
+root=${0:A:h:h}
+test_dir=$(mktemp -d /private/tmp/psvr2-audio-tests.XXXXXX)
+trap 'rm -rf "$test_dir"' EXIT
+# CBR padding makes this larger than the 256 MiB cache without an expensive
+# high-resolution encode. The audio is continuous, so any silence is a failure.
+ffmpeg -hide_banner -loglevel error \
+    -f lavfi -i 'testsrc2=size=640x360:rate=60' \
+    -f lavfi -i 'sine=frequency=440:sample_rate=48000' \
+    -t 70 -c:v libx264 -preset ultrafast -g 60 \
+    -b:v 80M -minrate 80M -maxrate 80M -bufsize 160M \
+    -x264-params nal-hrd=cbr -c:a aac "$test_dir/fixture.mp4"
+swiftc -O "$root/player/nas.swift" "$root/tools/audio-playback-tests.swift" \
+    -o "$test_dir/tests"
+"$test_dir/tests" "$test_dir/fixture.mp4"

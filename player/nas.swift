@@ -133,7 +133,11 @@ final class NASVideoAsset: NSObject, AVAssetResourceLoaderDelegate {
                     ?? AVFileType.mp4.rawValue
                 info.contentLength = length
                 info.isByteRangeAccessSupported = true
-                info.isEntireLengthAvailableOnDemand = false
+                // This is a complete, seekable file, even on a mounted NAS.
+                // Streaming mode can exhaust the audio queue while video
+                // continues; a seek then briefly restores sound. Use file
+                // loading semantics while our worker still handles SMB I/O.
+                info.isEntireLengthAvailableOnDemand = true
             }
             guard let dataRequest = request.dataRequest else {
                 request.finishLoading()
