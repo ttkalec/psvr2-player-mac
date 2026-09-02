@@ -97,6 +97,10 @@ right in the headset — browse folders (thumbnails, durations, resume
 positions) and click a video with the virtual cursor. You can also launch
 `player/PSVR2Player.app` from Finder/Dock instead.
 
+Click **Shuffle** in the file picker's bottom row to randomize the videos in
+the current folder. Folders stay at the top. Click again for a new order;
+the order is remembered when you return to that folder during the same app session.
+
 To open a specific file right away, pass it as an argument:
 
 ```sh

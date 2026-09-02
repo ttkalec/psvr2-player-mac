@@ -36,7 +36,7 @@ final class UIOverlay {
     private enum ButtonAction {
         case ui(UIAction)
         case pickerEntry(Int)
-        case pickerUp, pickerDown, pickerCancel, pickerDrives
+        case pickerUp, pickerDown, pickerCancel, pickerDrives, pickerShuffle
         case stopVideo // close the file and return to the list
         case timeline
         // "Format" submenu: explicit selection instead of cycling
@@ -94,6 +94,8 @@ final class UIOverlay {
     private var currentFile: URL?
     // Per-folder scroll position, to come back to the same spot
     private var scrollMemory: [String: Int] = [:]
+    // Keep shuffled file order when returning from playback or another folder.
+    private var shuffledFileOrder: [String: [String]] = [:]
 
     // Directory reading runs in the background: on external/network volumes
     // it can block (disk spin-up, macOS access prompt)
@@ -337,6 +339,16 @@ final class UIOverlay {
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.loadToken == token else { return }
                 self.pickerEntries = entries
+                if let order = self.shuffledFileOrder[dir.path] {
+                    let ranks = Dictionary(uniqueKeysWithValues: order.enumerated().map { ($0.element, $0.offset) })
+                    let dirs = entries.filter { $0.isDir }
+                    let files = entries.filter { !$0.isDir }.sorted {
+                        let lhs = ranks[$0.url.path], rhs = ranks[$1.url.path]
+                        if lhs != rhs { return (lhs ?? Int.max) < (rhs ?? Int.max) }
+                        return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+                    }
+                    self.pickerEntries = dirs + files
+                }
                 self.loading = false
                 self.restoreScroll()
                 if self.releasedForDialog {
@@ -376,19 +388,40 @@ final class UIOverlay {
                 highlighted: isCurrent))
         }
 
-        let bw = (w - 3 * gap) / 4
         let by = 10.0, bh = 56.0
         let bottom: [(String, ButtonAction)] = [
             ("▲", .pickerUp),
             ("▼", .pickerDown),
+            ("Shuffle", .pickerShuffle),
             ("💾 Drives", .pickerDrives),
             ("Cancel", .pickerCancel),
         ]
+        let bw = (w - Double(bottom.count - 1) * gap) / Double(bottom.count)
         for (i, item) in bottom.enumerated() {
             buttons.append(Button(
                 rect: CGRect(x: x0 + Double(i) * (bw + gap), y: by, width: bw, height: bh),
                 label: { item.0 }, action: item.1))
         }
+    }
+
+    private func shufflePickerFiles() {
+        guard !loading else { return }
+        let dirs = pickerEntries.filter { $0.isDir }
+        var files = pickerEntries.filter { !$0.isDir }
+        guard files.count > 1 else { return }
+        let previousOrder = files.map { $0.url.path }
+        files.shuffle()
+        // A click should visibly change the order, even in a small folder.
+        if files.map({ $0.url.path }) == previousOrder {
+            files.append(files.removeFirst())
+        }
+        pickerEntries = dirs + files
+        shuffledFileOrder[pickerDir.path] = files.map { $0.url.path }
+        pickerScroll = min(dirs.count, max(0, pickerEntries.count - pickerRows))
+        scrollMemory[pickerDir.path] = pickerScroll
+        metaCache.cancelPending()
+        buildPickerButtons()
+        redrawSoon()
     }
 
     // Return to the previous position; if the open file is in this folder — to it
@@ -632,6 +665,8 @@ final class UIOverlay {
             scrollPicker(rows: -pickerRows)
         case .pickerDown:
             scrollPicker(rows: pickerRows)
+        case .pickerShuffle:
+            shufflePickerFiles()
         case .pickerDrives:
             loadDir(URL(fileURLWithPath: "/Volumes"))
             redrawSoon()
