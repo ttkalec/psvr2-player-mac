@@ -1018,7 +1018,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     var passthrough: PassthroughSource?
     private var pausedByPassthrough = false
     // UI panel in tan space: center and half-sizes (2:1 aspect like the texture)
-    let panelCenter = SIMD2<Float>(0, -0.05)
+    let panelCenter = SIMD2<Float>(0, 0)
     let panelHalf = SIMD2<Float>(0.5, 0.25)
     // Panel anchor in world space: gaze direction (yaw+pitch, no roll)
     // at the moment it was shown
@@ -1156,6 +1156,16 @@ final class Renderer: NSObject, MTKViewDelegate {
         overlay?.openPicker()
     }
 
+    // Re-anchor only after viewRotation applies the new scene coordinates.
+    func requestRecenter(full: Bool = false) {
+        if full {
+            tracker.requestFullRecenter()
+        } else {
+            tracker.requestRecenter()
+        }
+        reanchorPanel = true
+    }
+
     // Anchor the panel in front of the current gaze (keeping the horizon)
     func anchorPanel() {
         let f = tracker.viewQuat.act(SIMD3<Float>(0, 0, -1))
@@ -1183,8 +1193,7 @@ final class Renderer: NSObject, MTKViewDelegate {
                 wornRecenterArmed = true
             } else if wornRecenterArmed && now - proxRawSince > 0.4 {
                 didWornRecenter = true
-                tracker.requestRecenter()
-                reanchorPanel = true
+                requestRecenter()
                 print("[player] headset on — scene and panel aligned to gaze")
             }
         }
@@ -1223,7 +1232,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         if button && !buttonLongFired && nowBtn - buttonDownTime > 0.8 {
             buttonLongFired = true
             pendingSingleClick = false
-            tracker.requestFullRecenter()
+            requestRecenter(full: true)
             overlay?.showOSD("Centered on gaze direction")
             print("[player] full recenter (long headset button press)")
         }
@@ -1240,7 +1249,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         // A single press fires once a pair can no longer happen
         if pendingSingleClick && nowBtn - lastClickTime > 0.45 {
             pendingSingleClick = false
-            tracker.requestRecenter()
+            requestRecenter()
             print("[player] recenter (headset button)")
         }
         lastButton = button
@@ -1396,7 +1405,7 @@ final class PlayerView: MTKView {
             psvr2_stop()
             exit(0)
         case 15: // R
-            r.tracker.requestRecenter()
+            r.requestRecenter()
             print("[player] recenter")
         case 3: // F
             cycleProjection()
@@ -1627,7 +1636,7 @@ final class PlayerView: MTKView {
         case .volDown: changeVolume(by: -0.05)
         case .volUp: changeVolume(by: 0.05)
         case .recenter:
-            r.tracker.requestRecenter()
+            r.requestRecenter()
             print("[player] recenter")
         case .cycleProjection: cycleProjection()
         case .cycleStereo: cycleStereo()

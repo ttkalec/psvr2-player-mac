@@ -153,7 +153,8 @@ during this test. It requires ffmpeg and an available macOS audio output.
 In macOS Settings, set the "PS VR2" display to 120 Hz.
 
 Keys: `Space` pause/resume, once per press while the app is active ·
-`R`/Fn button on the headset — recenter (long-press Fn
+`R`/Fn button on the headset — recenter, placing the HUD directly in front
+of your current gaze, including when looking up or down (long-press Fn
 centers the video on your gaze, handy when lying down; double-press — camera
 view) · `B` camera view (`M` stereo/mono, `,`/`.` convergence) ·
 `F` projection · `G` stereo · `V` vertical flip · `,`/`.` stereo depth (pushes
