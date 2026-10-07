@@ -37,6 +37,7 @@ final class UIOverlay {
         case ui(UIAction)
         case pickerEntry(Int)
         case pickerUp, pickerDown, pickerCancel, pickerDrives, pickerShuffle
+        case deleteFile(URL), moveFile(URL), dismissFileActions
         case stopVideo // close the file and return to the list
         case timeline
         // "Format" submenu: explicit selection instead of cycling
@@ -51,12 +52,6 @@ final class UIOverlay {
         let label: () -> String
         let action: ButtonAction
         var highlighted = false // currently open file
-    }
-
-    private struct PickerEntry {
-        let url: URL
-        let isDir: Bool
-        let name: String
     }
 
     private(set) var texture: MTLTexture
@@ -79,7 +74,9 @@ final class UIOverlay {
     private var mode = PanelMode.controls
     private var buttons: [Button] = []
     private var pickerDir = FileManager.default.homeDirectoryForCurrentUser
-    private var pickerEntries: [PickerEntry] = []
+    private var pickerFiles = PickerFileList()
+    private var fileActionTarget: URL?
+    private var fileOperationInProgress = false
     private var pickerScroll = 0
     private let pickerRows = 6
     private let videoExtensions: Set<String> = ["mp4", "m4v", "mov"]
@@ -94,8 +91,6 @@ final class UIOverlay {
     private var currentFile: URL?
     // Per-folder scroll position, to come back to the same spot
     private var scrollMemory: [String: Int] = [:]
-    // Keep shuffled file order when returning from playback or another folder.
-    private var shuffledFileOrder: [String: [String]] = [:]
 
     // Directory reading runs in the background: on external/network volumes
     // it can block (disk spin-up, macOS access prompt)
@@ -110,6 +105,7 @@ final class UIOverlay {
 
     private var lastActivity = CACurrentMediaTime()
     private var lastRedraw = 0.0
+    private var redrawRequested = true
     // Motion accumulator for waking the panel: filters out mouse jitter
     private var wakeAccum = 0.0
     private var lastWakeMove = 0.0
@@ -141,12 +137,6 @@ final class UIOverlay {
         osdText = nil
         osdDirty = true
         redrawSoon()
-    }
-
-    // An asynchronous buffering update must not erase a newer user message.
-    func clearOSD(matching text: String) {
-        guard osdText == text else { return }
-        clearOSD()
     }
 
     func showOSD(_ text: String, duration: Double = 1.5) {
@@ -290,13 +280,15 @@ final class UIOverlay {
     }
 
     private func loadDir(_ dir: URL) {
+        guard !fileOperationInProgress else { return }
+        fileActionTarget = nil
         // Remember where we stopped in the folder we are leaving
-        if !pickerEntries.isEmpty {
+        if !pickerFiles.entries.isEmpty {
             scrollMemory[pickerDir.path] = pickerScroll
         }
         pickerDir = dir
         pickerScroll = 0
-        pickerEntries = []
+        pickerFiles.entries = []
         metaCache.cancelPending() // thumbnails of the folder we left are no longer needed
         loading = true
         loadStarted = CACurrentMediaTime()
@@ -344,17 +336,7 @@ final class UIOverlay {
 
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.loadToken == token else { return }
-                self.pickerEntries = entries
-                if let order = self.shuffledFileOrder[dir.path] {
-                    let ranks = Dictionary(uniqueKeysWithValues: order.enumerated().map { ($0.element, $0.offset) })
-                    let dirs = entries.filter { $0.isDir }
-                    let files = entries.filter { !$0.isDir }.sorted {
-                        let lhs = ranks[$0.url.path], rhs = ranks[$1.url.path]
-                        if lhs != rhs { return (lhs ?? Int.max) < (rhs ?? Int.max) }
-                        return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
-                    }
-                    self.pickerEntries = dirs + files
-                }
+                self.pickerFiles.load(entries, in: dir)
                 self.loading = false
                 self.restoreScroll()
                 if self.releasedForDialog {
@@ -371,27 +353,47 @@ final class UIOverlay {
 
     private func buildPickerButtons() {
         buttons.removeAll()
+        if let target = fileActionTarget {
+            let actions: [(String, ButtonAction)] = [
+                ("Move", .moveFile(target)),
+                ("Delete", .deleteFile(target)),
+                ("Cancel", .dismissFileActions),
+            ]
+            for (i, item) in actions.enumerated() {
+                buttons.append(Button(
+                    rect: CGRect(x: 148 + i * 248, y: 118, width: 232, height: 72),
+                    label: { item.0 }, action: item.1))
+            }
+            return
+        }
         let x0 = 24.0, gap = 8.0
         let w = Double(Self.texW) - 48.0
         let rowH = 54.0
 
         for i in 0..<pickerRows {
             let idx = pickerScroll + i
-            guard idx < pickerEntries.count else { break }
+            guard idx < pickerFiles.entries.count else { break }
             let yTop = 76.0 + Double(i) * (rowH + gap)
-            let entry = pickerEntries[idx]
+            let entry = pickerFiles.entries[idx]
             let inVolumes = pickerDir.path == "/Volumes"
             let isCurrent = !entry.isDir && entry.url.path == currentFile?.path
             buttons.append(Button(
-                rect: CGRect(x: x0, y: Double(Self.texH) - yTop - rowH, width: w, height: rowH),
+                rect: CGRect(x: x0, y: Double(Self.texH) - yTop - rowH,
+                             width: entry.isDir ? w : w - 116, height: rowH),
                 label: {
                     let icon = entry.isDir
                         ? (inVolumes && entry.name != ".." ? "💾 " : "📁 ")
                         : (isCurrent ? "▶ " : "🎬 ")
-                    return icon + String(entry.name.prefix(48))
+                    return icon + entry.name
                 },
                 action: .pickerEntry(idx),
                 highlighted: isCurrent))
+            if !entry.isDir {
+                buttons.append(Button(
+                    rect: CGRect(x: x0 + w - 108, y: Double(Self.texH) - yTop - rowH,
+                                 width: 108, height: rowH),
+                    label: { "Move" }, action: .moveFile(entry.url)))
+            }
         }
 
         let by = 10.0, bh = 56.0
@@ -411,19 +413,11 @@ final class UIOverlay {
     }
 
     private func shufflePickerFiles() {
-        guard !loading else { return }
-        let dirs = pickerEntries.filter { $0.isDir }
-        var files = pickerEntries.filter { !$0.isDir }
-        guard files.count > 1 else { return }
-        let previousOrder = files.map { $0.url.path }
-        files.shuffle()
-        // A click should visibly change the order, even in a small folder.
-        if files.map({ $0.url.path }) == previousOrder {
-            files.append(files.removeFirst())
-        }
-        pickerEntries = dirs + files
-        shuffledFileOrder[pickerDir.path] = files.map { $0.url.path }
-        pickerScroll = min(dirs.count, max(0, pickerEntries.count - pickerRows))
+        guard !loading, !fileOperationInProgress else { return }
+        fileActionTarget = nil
+        let dirs = pickerFiles.entries.filter { $0.isDir }
+        pickerFiles.shuffle(in: pickerDir)
+        pickerScroll = min(dirs.count, max(0, pickerFiles.entries.count - pickerRows))
         scrollMemory[pickerDir.path] = pickerScroll
         metaCache.cancelPending()
         buildPickerButtons()
@@ -432,11 +426,11 @@ final class UIOverlay {
 
     // Return to the previous position; if the open file is in this folder — to it
     private func restoreScroll() {
-        let maxScroll = max(0, pickerEntries.count - pickerRows)
+        let maxScroll = max(0, pickerFiles.entries.count - pickerRows)
 
         if let current = currentFile,
            current.deletingLastPathComponent().path == pickerDir.path,
-           let idx = pickerEntries.firstIndex(where: { $0.url.path == current.path }) {
+           let idx = pickerFiles.entries.firstIndex(where: { $0.url.path == current.path }) {
             // Put the file in the middle of the visible area
             pickerScroll = min(maxScroll, max(0, idx - pickerRows / 2))
             return
@@ -446,12 +440,87 @@ final class UIOverlay {
     }
 
     func scrollPicker(rows: Int) {
-        guard mode == .picker else { return }
+        guard mode == .picker, fileActionTarget == nil, !fileOperationInProgress else { return }
         markActivity()
-        pickerScroll = max(0, min(max(0, pickerEntries.count - pickerRows), pickerScroll + rows))
+        pickerScroll = pickerFiles.clampedScroll(pickerScroll + rows, rows: pickerRows)
         scrollMemory[pickerDir.path] = pickerScroll
         buildPickerButtons()
         redrawSoon()
+    }
+
+    // The file menu is drawn in the headset texture, like the rest of the HUD.
+    @discardableResult
+    func rightClick() -> Bool {
+        guard active, hmdWorn, mode == .picker, !loading, !fileOperationInProgress,
+              fileActionTarget == nil else { return false }
+        let idx = hitIndex()
+        guard idx >= 0 else { return false }
+        let target: URL
+        switch buttons[idx].action {
+        case .pickerEntry(let i):
+            guard !pickerFiles.entries[i].isDir else { return false }
+            target = pickerFiles.entries[i].url
+        case .moveFile(let url):
+            target = url
+        default:
+            return false
+        }
+        fileActionTarget = target
+        markActivity()
+        buildPickerButtons()
+        redrawSoon()
+        return true
+    }
+
+    private func performFileOperation(_ operation: PickerFileOperation, on url: URL) {
+        guard !loading, !fileOperationInProgress,
+              pickerFiles.entries.contains(where: { !$0.isDir && $0.url.path == url.path }) else { return }
+        fileOperationInProgress = true
+        fileActionTarget = nil
+        metaCache.cancelPending()
+        // Release the decoder and NAS reader before touching their source file.
+        if let playing = renderer?.video?.url,
+           playing.resolvingSymlinksInPath() == url.resolvingSymlinksInPath() {
+            renderer?.stopVideo(returnToPicker: false)
+        }
+        buildPickerButtons()
+        showOSD(operation == .delete ? "Deleting…" : "Moving to !vr…", duration: 3600)
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Result { try operation.perform(on: url) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.fileOperationInProgress = false
+                switch result {
+                case .success(let destination):
+                    self.pickerFiles.remove(url)
+                    self.pickerScroll = self.pickerFiles.clampedScroll(self.pickerScroll, rows: self.pickerRows)
+                    self.scrollMemory[self.pickerDir.path] = self.pickerScroll
+                    self.metaCache.invalidate(url)
+                    if let destination {
+                        self.metaCache.invalidate(destination)
+                        ResumeStore.set(ResumeStore.position(for: url), for: destination)
+                    }
+                    ResumeStore.set(nil, for: url)
+                    if self.currentFile?.path == url.path {
+                        self.currentFile = destination
+                    }
+                    if UserDefaults.standard.string(forKey: "lastFile") == url.path {
+                        if let destination {
+                            UserDefaults.standard.set(destination.path, forKey: "lastFile")
+                        } else {
+                            UserDefaults.standard.removeObject(forKey: "lastFile")
+                        }
+                    }
+                    self.showOSD(destination == nil ? "File deleted" : "File moved to !vr", duration: 3)
+                case .failure(let error):
+                    self.showOSD(error.localizedDescription, duration: 8)
+                    print("[files] \(operation) failed for \(url.path): \(error.localizedDescription)")
+                }
+                self.buildPickerButtons()
+                self.redrawSoon()
+            }
+        }
     }
 
     // MARK: - Lifecycle
@@ -461,6 +530,13 @@ final class UIOverlay {
         // Also run when the HUD is hidden, so deactivation, video stop, and
         // passthrough transitions always restore normal desktop mouse control.
         defer { updateMouseCapture() }
+        // A static picker no longer repaints periodically, so expire its toast
+        // explicitly. Hidden toasts also clear without repainting every frame.
+        if osdText != nil && !osdActive {
+            osdText = nil
+            osdDirty = true
+            redrawSoon()
+        }
         let (dx, dy) = CGGetLastMouseDelta()
         let moved = dx != 0 || dy != 0
         // While the right button is held, the mouse rotates the scene: don't
@@ -558,17 +634,18 @@ final class UIOverlay {
             return
         }
 
-        // Redraw: hover change or progress tick; more often over the timeline
-        // so the time plate follows the cursor
+        // A static picker only repaints after a change. Drawing text
+        // and uploading the HUD on this thread consumes the headset's 8.3 ms
+        // frame budget even when the video is stopped.
         let hovered = hitIndex()
-        var maxAge = 0.5
+        var maxAge = mode == .picker ? Double.infinity : 0.5
         if scrubbing {
             scrubFraction = timelineFraction()
             maxAge = 1.0 / 30
         } else if hovered >= 0, case .timeline = buttons[hovered].action {
             maxAge = 1.0 / 30
         }
-        if hovered != lastHovered || CACurrentMediaTime() - lastRedraw > maxAge {
+        if redrawRequested || hovered != lastHovered || CACurrentMediaTime() - lastRedraw > maxAge {
             redraw()
         }
     }
@@ -626,6 +703,10 @@ final class UIOverlay {
 
     func hide(releaseCapture: Bool = false) {
         active = false
+        if fileActionTarget != nil {
+            fileActionTarget = nil
+            buildPickerButtons()
+        }
         // The format submenu doesn't survive hiding the panel
         if mode == .format {
             mode = .controls
@@ -651,8 +732,15 @@ final class UIOverlay {
     // Click on the panel; returns an action for the player if its button was hit
     func click() -> UIAction? {
         lastActivity = CACurrentMediaTime()
+        guard !fileOperationInProgress else { return nil }
         let idx = hitIndex()
         guard idx >= 0 else {
+            if fileActionTarget != nil {
+                fileActionTarget = nil
+                buildPickerButtons()
+                redrawSoon()
+                return nil
+            }
             // Click outside buttons (or on the margin around the panel) hides
             // the panel. Without an open video keep the file list: behind it
             // is an empty scene
@@ -666,7 +754,7 @@ final class UIOverlay {
         case .ui(let action):
             return action
         case .pickerEntry(let i):
-            let entry = pickerEntries[i]
+            let entry = pickerFiles.entries[i]
             if entry.isDir {
                 loadDir(entry.url)
             } else {
@@ -688,6 +776,14 @@ final class UIOverlay {
             scrollPicker(rows: pickerRows)
         case .pickerShuffle:
             shufflePickerFiles()
+        case .deleteFile(let url):
+            performFileOperation(.delete, on: url)
+        case .moveFile(let url):
+            performFileOperation(.move, on: url)
+        case .dismissFileActions:
+            fileActionTarget = nil
+            buildPickerButtons()
+            redrawSoon()
         case .pickerDrives:
             loadDir(URL(fileURLWithPath: "/Volumes"))
             redrawSoon()
@@ -767,7 +863,7 @@ final class UIOverlay {
     }
 
     func redrawSoon() {
-        lastRedraw = 0
+        redrawRequested = true
     }
 
     // MARK: - Drawing
@@ -801,6 +897,8 @@ final class UIOverlay {
 
     private func redraw() {
         lastRedraw = CACurrentMediaTime()
+        redrawRequested = false
+        osdDirty = false
         lastHovered = hitIndex()
 
         guard let ctx = CGContext(
@@ -843,8 +941,8 @@ final class UIOverlay {
                 ctx.setFillColor(CGColor(red: 0.20, green: 0.22, blue: 0.27, alpha: 0.95))
             }
             ctx.fillPath()
-            if case .pickerEntry(let idx) = b.action, !pickerEntries[idx].isDir {
-                drawVideoRow(ctx, rect: b.rect, entry: pickerEntries[idx])
+            if case .pickerEntry(let idx) = b.action, !pickerFiles.entries[idx].isDir {
+                drawVideoRow(ctx, rect: b.rect, entry: pickerFiles.entries[idx])
                 continue
             }
             let fontSize: CGFloat = mode == .picker ? 26 : (mode == .format ? 28 : 34)
@@ -871,10 +969,17 @@ final class UIOverlay {
                 drawText("No file open", in: topRect, size: 30, color: NSColor(white: 0.7, alpha: 1))
             }
         case .picker:
-            let path = pickerDir.path
-            let shown = path.count > 52 ? "…" + path.suffix(51) : path
-            drawText(loading ? "Reading… " + shown : shown,
+            let path = fileActionTarget?.lastPathComponent ?? pickerDir.path
+            drawText(loading ? "Reading… " + path : path,
                      in: topRect, size: 26, color: NSColor(white: 0.75, alpha: 1))
+            if fileActionTarget != nil {
+                drawText("Move to the !vr folder one level up.",
+                         in: CGRect(x: 24, y: 310, width: 976, height: 48),
+                         size: 28, color: .white)
+                drawText("Delete permanently removes this file from disk.",
+                         in: CGRect(x: 24, y: 248, width: 976, height: 48),
+                         size: 26, color: NSColor(white: 0.75, alpha: 1))
+            }
         case .format:
             drawText("Playback format", in: topRect, size: 30,
                      color: NSColor(white: 0.92, alpha: 1))
@@ -930,7 +1035,7 @@ final class UIOverlay {
     // Video file row in the list: thumbnail, name, duration and resolution,
     // a "where you left off" progress strip over the thumbnail
     private func drawVideoRow(_ ctx: CGContext, rect: CGRect, entry: PickerEntry) {
-        metaCache.request(entry.url)
+        if !fileOperationInProgress { metaCache.request(entry.url) }
         let meta = metaCache.meta(for: entry.url)
 
         let thumbRect = CGRect(x: rect.minX + 5, y: rect.minY + 4,
@@ -956,7 +1061,7 @@ final class UIOverlay {
 
         let textX = rect.minX + 100
         let isCurrent = entry.url.path == currentFile?.path
-        let name = (isCurrent ? "▶ " : "") + String(entry.name.prefix(52))
+        let name = (isCurrent ? "▶ " : "") + entry.name
         drawText(name,
                  in: CGRect(x: textX, y: rect.midY - 2,
                             width: rect.maxX - 8 - textX, height: rect.height / 2 - 2),
@@ -997,11 +1102,17 @@ final class UIOverlay {
     }
 
     private func upload(_ ctx: CGContext) {
-        if let data = ctx.data {
-            texture.replace(
-                region: MTLRegionMake2D(0, 0, Self.texW, Self.texH), mipmapLevel: 0,
-                withBytes: data, bytesPerRow: Self.texW * 4)
-        }
+        guard let data = ctx.data else { return }
+        // Publish a new texture after uploading. The render thread and GPU
+        // may still be reading the previous HUD while AppKit paints this one.
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm, width: Self.texW, height: Self.texH, mipmapped: false)
+        desc.usage = [.shaderRead]
+        guard let updated = texture.device.makeTexture(descriptor: desc) else { return }
+        updated.replace(
+            region: MTLRegionMake2D(0, 0, Self.texW, Self.texH), mipmapLevel: 0,
+            withBytes: data, bytesPerRow: Self.texW * 4)
+        texture = updated
     }
 
     private func isEntryButton(_ b: Button) -> Bool {
@@ -1011,10 +1122,29 @@ final class UIOverlay {
 
     private func drawText(_ s: String, in rect: CGRect, size: CGFloat, color: NSColor,
                           centered: Bool = true) {
-        let str = NSAttributedString(string: s, attributes: [
+        let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: size, weight: .semibold),
             .foregroundColor: color,
-        ])
+        ]
+        let available = max(0, rect.width - (centered ? 0 : 36))
+        var str = NSAttributedString(string: s, attributes: attributes)
+        if str.size().width > available {
+            // Keep the beginning and extension visible without wrapping into
+            // metadata or the Move button. AppKit's draw(at:) stays single-line.
+            let characters = Array(s)
+            func shortened(_ count: Int) -> NSAttributedString {
+                let text = String(characters.prefix((count + 1) / 2)) + "…"
+                    + String(characters.suffix(count / 2))
+                return NSAttributedString(string: text, attributes: attributes)
+            }
+            var low = 0, high = characters.count
+            while low < high {
+                let mid = (low + high + 1) / 2
+                if shortened(mid).size().width <= available { low = mid }
+                else { high = mid - 1 }
+            }
+            str = shortened(low)
+        }
         let sz = str.size()
         let x = centered ? rect.midX - sz.width / 2 : rect.minX + 18
         str.draw(at: CGPoint(x: x, y: rect.midY - sz.height / 2))

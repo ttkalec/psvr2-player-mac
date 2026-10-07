@@ -255,13 +255,15 @@ fragment float4 fs_main(VSOut in [[stage_in]],
 
     // Control panel: anchored in space along the gaze direction at the moment
     // it was shown (~1.5 m, slight parallax). The ray direction is transformed
-    // by the current pose into world space, then into panel space; coordinates
-    // use the green channel, without the video flip
-    if (uni.p2.y > 0.5) {
-        float aG = local_x * scale[1];
-        float bG = (local_y - 0.0002302693) * scale[1];
-        float panelTanX = k3 * aG - k4 * bG;
-        float panelTanUp = -(k4 * aG + k3 * bG);
+    // by the current pose into world space, then into panel space, without the
+    // video flip. Sample and composite each color along its own corrected ray,
+    // including alpha and the cursor, so text edges align through the lenses.
+    for (int ch = chFrom; uni.p2.y > 0.5 && ch <= chTo; ch++) {
+        float ny = local_y + (ch == 1 ? -0.0002302693 : 0.0);
+        float a = local_x * scale[ch];
+        float b = ny * scale[ch];
+        float panelTanX = k3 * a - k4 * b;
+        float panelTanUp = -(k4 * a + k3 * b);
 
         float3 wDir = (uni.rot * float4(panelTanX, panelTanUp, -1.0, 0.0)).xyz;
         float3 pDir = (uni.panelInv * float4(wDir, 0.0)).xyz;
@@ -287,7 +289,13 @@ fragment float4 fs_main(VSOut in [[stage_in]],
                     uiC = float4(0.0, 0.0, 0.0, 1.0);
                 }
 
-                rgb = rgb * (1.0 - uiC.a) + uiC.rgb; // premultiplied alpha
+                // The texture has premultiplied alpha. Its coverage must come
+                // from the same ray as the color, especially at text edges.
+                if (chromatic) {
+                    rgb[ch] = rgb[ch] * (1.0 - uiC.a) + uiC[ch];
+                } else {
+                    rgb = rgb * (1.0 - uiC.a) + uiC.rgb;
+                }
             }
         }
     }
@@ -384,23 +392,39 @@ struct PlaybackConfig {
 // MARK: - Head tracking
 
 final class HeadTracker {
+    private let lock = NSRecursiveLock()
     private var recenter = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
     private var didAutoRecenter = false
     private let correction = simd_quatf(ix: 0, iy: 0, iz: sqrt(0.5), r: sqrt(0.5))
-    var connected = false
-    var predictionEnabled = true
-    // Output latency: render + display scanout (adjusted with [ and ]).
-    // The default follows the panel rate — see Renderer.setPanelRate
-    var extraLookaheadS: Float = 0.010
+    private var _connected = false
+    var connected: Bool { locked { _connected } }
+    private var _predictionEnabled = true
+    var predictionEnabled: Bool {
+        get { locked { _predictionEnabled } }
+        set { locked { _predictionEnabled = newValue } }
+    }
+    // Fixed prediction horizon for the fallback renderer. With the dedicated
+    // display driver, its difference from the default adjusts automatic timing.
+    private var _extraLookaheadS: Float = 0.010
+    var extraLookaheadS: Float {
+        get { locked { _extraLookaheadS } }
+        set { locked { _extraLookaheadS = newValue } }
+    }
+
+    private func locked<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
 
     // Orientation in x-right, y-up, -z-forward space (Monado axes)
-    private func currentOrientation() -> simd_quatf? {
+    private func currentOrientation(lookahead: Float? = nil) -> simd_quatf? {
         // SLAM updates at ~60 Hz, render at the panel rate (90/120 Hz): the C core integrates the
         // pose forward with IMU samples (2000 Hz) and extrapolates by the
         // output latency
         if predictionEnabled {
             var q = [Float](repeating: 0, count: 4)
-            guard psvr2_get_predicted_quat(extraLookaheadS, &q) == 1 else { return nil }
+            guard psvr2_get_predicted_quat(lookahead ?? extraLookaheadS, &q) == 1 else { return nil }
             let mapped = simd_quatf(ix: q[1], iy: q[2], iz: q[3], r: q[0])
             return (correction * mapped).normalized
         }
@@ -423,6 +447,8 @@ final class HeadTracker {
     private var lastSmoothTime = CACurrentMediaTime()
 
     func requestRecenter() {
+        lock.lock()
+        defer { lock.unlock() }
         didAutoRecenter = false
         manualPitch = 0
         offsetTarget = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
@@ -432,6 +458,8 @@ final class HeadTracker {
     // Full recenter (long Fn press): the video center goes exactly where the
     // gaze points right now, including head pitch. For watching while lying down
     func requestFullRecenter() {
+        lock.lock()
+        defer { lock.unlock() }
         guard let q = currentOrientation() else {
             requestRecenter()
             return
@@ -447,6 +475,8 @@ final class HeadTracker {
     }
 
     func addManualRotation(dxPx: Double, dyPx: Double) {
+        lock.lock()
+        defer { lock.unlock() }
         _ = dxPx // horizontal is intentionally ignored
         let sens: Float = 0.002 // rad per pixel (~0.11°)
         // Pitch limited to ~±80°
@@ -465,18 +495,37 @@ final class HeadTracker {
 
     // Angular velocity in world (already recentered) space — for per-row
     // scanout correction in the shader
-    private(set) var worldAngularVelocity = SIMD3<Float>(repeating: 0)
+    private var worldAngularVelocity = SIMD3<Float>(repeating: 0)
 
     // Last view pose — used to anchor the UI panel
-    private(set) var viewQuat = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+    private var lastViewQuat = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+    var viewQuat: simd_quatf { locked { lastViewQuat } }
+
+    struct Pose {
+        var rotation: float4x4
+        var angularVelocity: SIMD3<Float>
+    }
 
     func viewRotation() -> float4x4 {
-        guard let q = currentOrientation() else {
-            connected = false
-            viewQuat = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
-            return matrix_identity_float4x4
+        samplePose().rotation
+    }
+
+    func samplePose(presentationTime: Double? = nil, panelHz: Float = 120,
+                    scanout: Float = 0) -> Pose {
+        lock.lock()
+        defer { lock.unlock() }
+        let lookahead = presentationTime.map {
+            PoseTiming.lookahead(now: CACurrentMediaTime(), presentation: $0,
+                period: 1 / Double(panelHz), scanout: Double(scanout),
+                adjustment: Double(_extraLookaheadS - 1.2 / panelHz))
         }
-        connected = true
+        guard let q = currentOrientation(lookahead: lookahead) else {
+            _connected = false
+            lastViewQuat = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+            worldAngularVelocity = .zero
+            return Pose(rotation: matrix_identity_float4x4, angularVelocity: .zero)
+        }
+        _connected = true
 
         if !didAutoRecenter {
             // Remove yaw only, keeping the horizon
@@ -488,7 +537,7 @@ final class HeadTracker {
 
         smoothManual()
         let view = offsetCurrent * recenter * q
-        viewQuat = view
+        lastViewQuat = view
 
         var gyro = [Float](repeating: 0, count: 3)
         var age: Double = 0
@@ -499,7 +548,7 @@ final class HeadTracker {
             worldAngularVelocity = .zero
         }
 
-        return float4x4(view)
+        return Pose(rotation: float4x4(view), angularVelocity: worldAngularVelocity)
     }
 }
 
@@ -529,6 +578,7 @@ final class VideoSource {
     private var textureCache: CVMetalTextureCache?
     private(set) var textureY: MTLTexture?
     private(set) var textureCbCr: MTLTexture?
+    private(set) var textureBacking: [CVMetalTexture] = []
     private(set) var fullRange = false
     private(set) var bt2020 = false
     private(set) var isBGRA = false
@@ -537,7 +587,6 @@ final class VideoSource {
     private var statusObserver: NSKeyValueObservation?
     let url: URL
     var onUnsupported: ((String) -> Void)?
-    var onBufferingChanged: ((Bool) -> Void)?
     private(set) var isBuffering = false
     private var loggedFormat = false
     private var noFrameSince = CACurrentMediaTime()
@@ -713,7 +762,6 @@ final class VideoSource {
         seeker.stop()
         if isBuffering {
             isBuffering = false
-            onBufferingChanged?(false)
         }
         player.replaceCurrentItem(with: nil)
         statusObserver = nil
@@ -867,7 +915,8 @@ final class VideoSource {
         if playing, let last = lastFrameHostTime {
             statMaxFrameGap = max(statMaxFrameGap, now - last)
         }
-        if pixelBuffer != nil, displayTime.isNumeric, displayTime != lastFrameTime {
+        let newFrame = pixelBuffer != nil && displayTime.isNumeric && displayTime != lastFrameTime
+        if newFrame {
             statVideoFrames += 1
             lastFrameTime = displayTime
             lastFrameHostTime = now
@@ -879,7 +928,6 @@ final class VideoSource {
                 || now - (lastFrameHostTime ?? noFrameSince) > 0.4)
         if buffering != isBuffering {
             isBuffering = buffering
-            onBufferingChanged?(buffering)
         }
         reportPlaybackStats(now: now)
         guard let pb = pixelBuffer,
@@ -889,6 +937,9 @@ final class VideoSource {
         }
         noFrameSince = CACurrentMediaTime()
         gotAnyFrame = true
+        // The panel redraws faster than the video. Reuse the same decoder
+        // surfaces between video frames, including while paused.
+        if !newFrame, displayTime.isNumeric, textureY != nil { return }
 
         let format = CVPixelBufferGetPixelFormatType(pb)
         let tenBit = format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
@@ -915,9 +966,11 @@ final class VideoSource {
         // Non-planar frame (BGRA) — read as RGB, no YUV conversion needed
         isBGRA = CVPixelBufferGetPlaneCount(pb) == 0
         if isBGRA {
-            if let tex = makeTexture(pb, cache: cache, plane: 0, format: .bgra8Unorm) {
+            if let backing = makeTexture(pb, cache: cache, plane: 0, format: .bgra8Unorm),
+               let tex = CVMetalTextureGetTexture(backing) {
                 textureY = tex
                 textureCbCr = tex
+                textureBacking = [backing]
             }
             return
         }
@@ -925,11 +978,12 @@ final class VideoSource {
         let yFormat: MTLPixelFormat = tenBit ? .r16Unorm : .r8Unorm
         let cbcrFormat: MTLPixelFormat = tenBit ? .rg16Unorm : .rg8Unorm
 
-        if let y = makeTexture(pb, cache: cache, plane: 0, format: yFormat) {
+        if let yBacking = makeTexture(pb, cache: cache, plane: 0, format: yFormat),
+           let ccBacking = makeTexture(pb, cache: cache, plane: 1, format: cbcrFormat),
+           let y = CVMetalTextureGetTexture(yBacking), let cbcr = CVMetalTextureGetTexture(ccBacking) {
             textureY = y
-        }
-        if let cbcr = makeTexture(pb, cache: cache, plane: 1, format: cbcrFormat) {
             textureCbCr = cbcr
+            textureBacking = [yBacking, ccBacking]
         }
     }
 
@@ -954,9 +1008,10 @@ final class VideoSource {
     }
 
     private func makeTexture(_ pb: CVPixelBuffer, cache: CVMetalTextureCache,
-                             plane: Int, format: MTLPixelFormat) -> MTLTexture? {
-        let w = CVPixelBufferGetWidthOfPlane(pb, plane)
-        let h = CVPixelBufferGetHeightOfPlane(pb, plane)
+                             plane: Int, format: MTLPixelFormat) -> CVMetalTexture? {
+        let planar = CVPixelBufferGetPlaneCount(pb) > 0
+        let w = planar ? CVPixelBufferGetWidthOfPlane(pb, plane) : CVPixelBufferGetWidth(pb)
+        let h = planar ? CVPixelBufferGetHeightOfPlane(pb, plane) : CVPixelBufferGetHeight(pb)
         var cvTex: CVMetalTexture?
         let res = CVMetalTextureCacheCreateTextureFromImage(
             nil, cache, pb, nil, format, w, h, plane, &cvTex)
@@ -964,7 +1019,7 @@ final class VideoSource {
             print("[video] failed to create texture for plane \(plane): code \(res)")
             return nil
         }
-        return CVMetalTextureGetTexture(cvTex)
+        return cvTex
     }
 
     // No frames — try the next pixel format
@@ -1006,6 +1061,20 @@ final class Renderer: NSObject, MTKViewDelegate {
     // loaded in the background after startup
     private var envTexture: MTLTexture?
     let tracker = HeadTracker()
+    private struct Frame {
+        let uniforms: Uniforms
+        let textures: [MTLTexture]
+        let videoBacking: [CVMetalTexture]
+        let gazePinned: Bool
+        let scanlineEnabled: Bool
+        let panelHz: Float
+    }
+    private let latestFrame = LatestFrame<Frame>()
+    private var frameDriver: HeadsetFrameDriver?
+    private let fallbackRenderQueue = DispatchQueue(label: "psvr2.render", qos: .userInteractive)
+    private let fallbackLock = NSLock()
+    private var fallbackPending = false
+    private var renderingStopped = false
     var video: VideoSource?
     var config: PlaybackConfig
     var calibration: [Float]
@@ -1029,19 +1098,37 @@ final class Renderer: NSObject, MTKViewDelegate {
     private(set) var panelHz: Float = 120
     private(set) var scanoutDuration: Float = (1.0 / 120.0) * (2040.0 / 2200.0)
 
+    var poseLookaheadLabel: String {
+        if frameDriver != nil {
+            return String(format: "auto %+.0f ms", (tracker.extraLookaheadS - 1.2 / panelHz) * 1000)
+        }
+        return "\(Int(tracker.extraLookaheadS * 1000)) ms"
+    }
+
     func setPanelRate(hz: Double) {
         guard hz > 30, abs(Float(hz) - panelHz) > 0.5 else { return }
         panelHz = Float(hz)
         scanoutDuration = (1.0 / panelHz) * (2040.0 / 2200.0)
         // Default lookahead ≈ 1.2 frames: 10 ms at 120 Hz, 13.3 ms at 90 Hz
         tracker.extraLookaheadS = 1.2 / panelHz
+        frameDriver?.setRate(hz: panelHz)
         print(String(format: "[display] panel mode %.0f Hz: scanout %.1f ms, lookahead %.1f ms",
             hz, scanoutDuration * 1000, tracker.extraLookaheadS * 1000))
     }
 
     // Diagnostics
     private var statFrames = 0
+    private let statGpuLock = NSLock()
+    private var statGpuFrames = 0
     private var statGpuTime = 0.0
+    private var statGpuMax = 0.0
+    private var statPresentedFrames = 0
+    private var statDroppedFrames = 0
+    private var statLastPresentedTime = 0.0
+    private var statPresentGapMax = 0.0
+    private var statLastFrame = 0.0
+    private var statMaxGap = 0.0
+    private var statCpuMax = 0.0
     private var statLastReport = CACurrentMediaTime()
 
     init(device: MTLDevice, config: PlaybackConfig, calibration: [Float]) throws {
@@ -1108,6 +1195,51 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
+    func startRendering(layer: CAMetalLayer, displayID: CGDirectDisplayID) {
+        statLastReport = CACurrentMediaTime()
+        if let driver = HeadsetFrameDriver(layer: layer, displayID: displayID, hz: panelHz,
+            render: { [weak self] drawable, time in
+                self?.render(drawable: drawable, presentationTime: time) ?? false
+            }) {
+            frameDriver = driver
+            if driver.start() {
+                print("[display] Dedicated headset display thread: presentation-timed pose")
+                return
+            }
+            frameDriver = nil
+        }
+        print("[display] Render display link unavailable; background rendering with scene-update pacing")
+    }
+
+    func stopRendering() {
+        frameDriver?.stop()
+        frameDriver = nil
+        fallbackLock.lock()
+        renderingStopped = true
+        fallbackLock.unlock()
+        fallbackRenderQueue.sync {}
+    }
+
+    private func requestFallbackRender(layer: CAMetalLayer) {
+        fallbackLock.lock()
+        guard !fallbackPending, !renderingStopped else { fallbackLock.unlock(); return }
+        fallbackPending = true
+        fallbackLock.unlock()
+        fallbackRenderQueue.async { [weak self] in
+            guard let self else { return }
+            self.fallbackLock.lock()
+            self.fallbackPending = false
+            let stopped = self.renderingStopped
+            self.fallbackLock.unlock()
+            guard !stopped else { return }
+            autoreleasepool {
+                if let drawable = layer.nextDrawable() {
+                    self.render(drawable: drawable, presentationTime: nil)
+                }
+            }
+        }
+    }
+
     func setPlaybackRate(_ v: Float) {
         playbackRate = v
         if let p = video?.player, p.rate != 0 {
@@ -1145,7 +1277,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 
     // Stop: close the file (position is saved) and return to the file list
-    func stopVideo() {
+    func stopVideo(returnToPicker: Bool = true) {
         guard let v = video else { return }
         v.savePosition()
         v.stop()
@@ -1153,7 +1285,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         autoPaused = false
         pausedByPassthrough = false
         print("[player] stop — file closed")
-        overlay?.openPicker()
+        if returnToPicker { overlay?.openPicker() }
     }
 
     // Re-anchor only after viewRotation applies the new scene coordinates.
@@ -1220,6 +1352,8 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
+        // Main thread: input, AppKit drawing and video delivery. Publish a
+        // complete scene; the render thread keeps using it during a UI stall.
         // Fn button on the headset: single press — recenter (horizon kept),
         // double — camera view and back, long (>0.8 s) — video center exactly
         // along the gaze direction
@@ -1260,18 +1394,12 @@ final class Renderer: NSObject, MTKViewDelegate {
         video?.updateTexture()
         passthrough?.update()
 
-        guard let drawable = view.currentDrawable,
-              let rpd = view.currentRenderPassDescriptor,
-              let cmd = queue.makeCommandBuffer(),
-              let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
-
         let rot = tracker.viewRotation()
         // Anchor the panel after recenter is applied (viewQuat is already fresh)
         if reanchorPanel {
             reanchorPanel = false
             anchorPanel()
         }
-        let gyroW = scanlineEnabled ? tracker.worldAngularVelocity : .zero
 
         // The panel is fixed in the world; a lone OSD toast is glued to the
         // gaze (panelInv * rot = I). If the panel drifts more than ~70° out
@@ -1291,7 +1419,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         // the shader's video path as a 360° mono BGRA "video"
         let env = video == nil ? envTexture : nil
 
-        var uni = Uniforms(
+        let uni = Uniforms(
             rot: rot,
             panelInv: panelInv,
             calibL: SIMD4(calibration[0], calibration[1], calibration[4], calibration[5]),
@@ -1301,7 +1429,7 @@ final class Renderer: NSObject, MTKViewDelegate {
                 Float((env != nil ? .mono : config.stereo).rawValue),
                 config.fisheyeFovDeg * .pi / 180,
                 env != nil ? 1 : config.flipV),
-            p1: SIMD4(gyroW.x, gyroW.y, gyroW.z, scanoutDuration),
+            p1: SIMD4(0, 0, 0, scanoutDuration),
             p2: SIMD4(
                 chromaticEnabled ? 1 : 0,
                 // While RMB is held (scene rotation), hide the panel and cursor
@@ -1322,35 +1450,109 @@ final class Renderer: NSObject, MTKViewDelegate {
                 Float(passthrough?.source.rawValue ?? 0)),
             p6: SIMD4(passthrough?.convergence ?? 0, env != nil ? 0 : config.depth, 0, 0))
 
+        latestFrame.publish(Frame(uniforms: uni, textures: [
+            video?.textureY ?? env ?? placeholderY,
+            overlay?.texture ?? placeholderY,
+            video?.textureCbCr ?? placeholderCbCr,
+            passthrough?.textureL ?? placeholderY,
+            passthrough?.textureR ?? placeholderY,
+        ], videoBacking: video?.textureBacking ?? [], gazePinned: overlay?.active != true,
+            scanlineEnabled: scanlineEnabled, panelHz: panelHz))
+        if frameDriver == nil, let layer = view.layer as? CAMetalLayer {
+            requestFallbackRender(layer: layer)
+        }
+    }
+
+    // Render thread: acquire the latest scene and sample the head immediately
+    // before encoding. No AppKit, decoder fetches or synchronous main dispatch.
+    @discardableResult
+    private func render(drawable: CAMetalDrawable, presentationTime: Double?) -> Bool {
+        let drawStarted = CACurrentMediaTime()
+        guard let frame = latestFrame.read() else { return false }
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = drawable.texture
+        pass.colorAttachments[0].loadAction = .dontCare
+        pass.colorAttachments[0].storeAction = .store
+        guard let cmd = queue.makeCommandBuffer(),
+              let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { return false }
+        let pose = tracker.samplePose(presentationTime: presentationTime,
+            panelHz: frame.panelHz, scanout: frame.uniforms.p1.w)
+        var uni = frame.uniforms
+        uni.rot = pose.rotation
+        if frame.gazePinned { uni.panelInv = pose.rotation.transpose }
+        let gyro = frame.scanlineEnabled ? pose.angularVelocity : .zero
+        uni.p1 = SIMD4(gyro.x, gyro.y, gyro.z, uni.p1.w)
         enc.setRenderPipelineState(pipeline)
         enc.setFragmentBytes(&uni, length: MemoryLayout<Uniforms>.stride, index: 0)
         enc.setFragmentBuffer(lutBuffer, offset: 0, index: 1)
-        enc.setFragmentTexture(video?.textureY ?? env ?? placeholderY, index: 0)
-        enc.setFragmentTexture(overlay?.texture ?? placeholderY, index: 1)
-        enc.setFragmentTexture(video?.textureCbCr ?? placeholderCbCr, index: 2)
-        enc.setFragmentTexture(passthrough?.textureL ?? placeholderY, index: 3)
-        enc.setFragmentTexture(passthrough?.textureR ?? placeholderY, index: 4)
+        for (index, texture) in frame.textures.enumerated() {
+            enc.setFragmentTexture(texture, index: index)
+        }
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
-        cmd.present(drawable)
-        cmd.addCompletedHandler { [weak self] buf in
+        drawable.addPresentedHandler { [weak self] presented in
             guard let self else { return }
-            DispatchQueue.main.async {
-                self.statGpuTime += buf.gpuEndTime - buf.gpuStartTime
+            let time = presented.presentedTime
+            self.statGpuLock.lock()
+            if time > 0 {
+                self.statPresentedFrames += 1
+                if self.statLastPresentedTime > 0, time > self.statLastPresentedTime {
+                    self.statPresentGapMax = max(self.statPresentGapMax, time - self.statLastPresentedTime)
+                }
+                self.statLastPresentedTime = max(time, self.statLastPresentedTime)
+            } else {
+                self.statDroppedFrames += 1
             }
+            self.statGpuLock.unlock()
+        }
+        cmd.present(drawable)
+        cmd.addCompletedHandler { [weak self, backing = frame.videoBacking] buf in
+            // Core Video owns the decoder surfaces. Retain its texture wrappers
+            // until the GPU finishes, including after a seek or file replacement.
+            withExtendedLifetime(backing) {}
+            guard let self else { return }
+            let elapsed = max(0, buf.gpuEndTime - buf.gpuStartTime)
+            // Do not put another main-thread block in the queue every frame.
+            self.statGpuLock.lock()
+            self.statGpuFrames += 1
+            self.statGpuTime += elapsed
+            self.statGpuMax = max(self.statGpuMax, elapsed)
+            self.statGpuLock.unlock()
         }
         cmd.commit()
 
         statFrames += 1
         let now = CACurrentMediaTime()
+        if statLastFrame > 0 { statMaxGap = max(statMaxGap, now - statLastFrame) }
+        statLastFrame = now
+        statCpuMax = max(statCpuMax, now - drawStarted)
         if now - statLastReport >= 2.0 {
             let fps = Double(statFrames) / (now - statLastReport)
-            let gpuMs = statFrames > 0 ? statGpuTime / Double(statFrames) * 1000 : 0
-            print(String(format: "[stat] fps=%.1f gpu=%.2fms mem=%.0fMB", fps, gpuMs, Self.memoryFootprintMB()))
-            statFrames = 0
+            statGpuLock.lock()
+            let gpuMs = statGpuFrames > 0 ? statGpuTime / Double(statGpuFrames) * 1000 : 0
+            let gpuMaxMs = statGpuMax * 1000
+            let presentFPS = Double(statPresentedFrames) / (now - statLastReport)
+            let presentGapMs = statPresentGapMax * 1000
+            let dropped = statDroppedFrames
+            statGpuFrames = 0
             statGpuTime = 0
+            statGpuMax = 0
+            statPresentedFrames = 0
+            statPresentGapMax = 0
+            statDroppedFrames = 0
+            statGpuLock.unlock()
+            // mispredicted: frames shown on another refresh than their pose
+            // was predicted for (each one jumps by head speed x 8 ms)
+            let timing = frameDriver?.schedule.takeStats() ?? (frames: 0, mispredicted: 0)
+            print(String(format: "[stat] fps=%.1f presentFPS=%.1f presentGapMax=%.1fms dropped=%d mispredicted=%d/%d gpu=%.2fms gpuMax=%.2fms drawGapMax=%.1fms cpuMax=%.1fms mem=%.0fMB",
+                fps, presentFPS, presentGapMs, dropped, timing.mispredicted, timing.frames,
+                gpuMs, gpuMaxMs, statMaxGap * 1000, statCpuMax * 1000, Self.memoryFootprintMB()))
+            statFrames = 0
+            statMaxGap = 0
+            statCpuMax = 0
             statLastReport = now
         }
+        return true
     }
 
     // Physical memory of the process — for spotting leaks in the log
@@ -1402,6 +1604,7 @@ final class PlayerView: MTKView {
             r.overlay?.hide(releaseCapture: true) // restore the system cursor
             r.video?.savePosition()
             r.video?.player.pause()
+            r.stopRendering()
             psvr2_stop()
             exit(0)
         case 15: // R
@@ -1457,10 +1660,10 @@ final class PlayerView: MTKView {
             }
         case 30: // ]
             r.tracker.extraLookaheadS = min(0.08, r.tracker.extraLookaheadS + 0.005)
-            print("[player] pose lookahead: \(Int(r.tracker.extraLookaheadS * 1000)) ms")
+            print("[player] pose lookahead: \(r.poseLookaheadLabel)")
         case 33: // [
             r.tracker.extraLookaheadS = max(0, r.tracker.extraLookaheadS - 0.005)
-            print("[player] pose lookahead: \(Int(r.tracker.extraLookaheadS * 1000)) ms")
+            print("[player] pose lookahead: \(r.poseLookaheadLabel)")
         case 24, 69: // + (=)
             changeFov(by: 5)
         case 27, 78: // -
@@ -1533,12 +1736,6 @@ final class PlayerView: MTKView {
         let requestID = seekRequestID
         let tolerance = CMTime(seconds: 2, preferredTimescale: 600)
         let targetSeconds = max(0, target.seconds.isFinite ? target.seconds : 0)
-        let wholeSeconds = Int(targetSeconds.rounded())
-        let targetText = wholeSeconds >= 3600
-            ? String(format: "%d:%02d:%02d", wholeSeconds / 3600,
-                     (wholeSeconds / 60) % 60, wholeSeconds % 60)
-            : String(format: "%d:%02d", wholeSeconds / 60, wholeSeconds % 60)
-        r.overlay?.showOSD("Seeking to \(targetText)…")
         let seekStarted = CACurrentMediaTime()
         print(String(format: "[playback] seek #%d requested=%.2fs", requestID, targetSeconds))
 
@@ -1580,8 +1777,21 @@ final class PlayerView: MTKView {
         print("[player] stereo: \(next.label)")
     }
 
+    private var rightDragDistance = 0.0
+
+    override func rightMouseDown(with event: NSEvent) {
+        rightDragDistance = 0
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        if rightDragDistance < 4 {
+            renderer?.overlay?.rightClick()
+        }
+    }
+
     override func rightMouseDragged(with event: NSEvent) {
         guard let r = renderer else { return }
+        rightDragDistance += abs(event.deltaX) + abs(event.deltaY)
         // "Grab" the scene: drag the image along with the cursor
         r.tracker.addManualRotation(dxPx: event.deltaX, dyPx: event.deltaY)
         r.overlay?.markActivity()
@@ -1772,10 +1982,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         view.renderer = renderer
         view.delegate = renderer
         view.colorPixelFormat = .bgra8Unorm
-        // MTKView's internal timer may tick from another (60 Hz) display —
-        // we draw ourselves from a CADisplayLink bound to the window's screen
+        // Update input/video from a display link bound to this screen;
+        // headset presentation has its own display thread.
         view.isPaused = true
         view.enableSetNeedsDisplay = false
+        if vrScreen != nil {
+            // A scaled desktop can have a 6400x3264 Retina backing store even
+            // though the headset panel is 4000x2040. Shade at panel resolution
+            // instead of paying for 2.56x as many pixels on every head movement.
+            view.autoResizeDrawable = false
+            view.drawableSize = CGSize(width: 4000, height: 2040)
+        }
         playerView = view
         (NSApp as? PlayerApplication)?.onPlaybackSpace = { [weak self] isRepeat in
             guard let self, self.renderer?.video != nil else { return false }
@@ -1816,16 +2033,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             view.keyDown(with: event)
             return nil
         }
-        _ = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDragged) { event in
-            view.rightMouseDragged(with: event)
+        _ = NSEvent.addLocalMonitorForEvents(matching: [.rightMouseDown, .rightMouseUp, .rightMouseDragged]) { event in
+            // Leave mouse input in access dialogs and the remote window alone.
+            guard event.window === view.window else { return event }
+            switch event.type {
+            case .rightMouseDown: view.rightMouseDown(with: event)
+            case .rightMouseUp: view.rightMouseUp(with: event)
+            default: view.rightMouseDragged(with: event)
+            }
             return nil
         }
 
-        // Pacing from the specific headset display via CVDisplayLink:
-        // CADisplayLink/MTKView may tick from another (60 Hz) screen
+        // Pace main-thread scene updates from the headset display. The
+        // render thread keeps presenting fresh head poses if these updates stall.
         let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as! NSNumber
         let displayID = CGDirectDisplayID(truncating: screenNumber)
         headsetDisplayID = displayID
+        print("[display] Render target: \(Int(view.drawableSize.width))x\(Int(view.drawableSize.height)), "
+            + "desktop backing: \(Int(screen.frame.width * screen.backingScaleFactor))x\(Int(screen.frame.height * screen.backingScaleFactor))")
         if let mode = CGDisplayCopyDisplayMode(displayID) {
             print("[display] Headset display refresh rate per CoreGraphics: \(mode.refreshRate) Hz, "
                 + "screen maxFPS: \(screen.maximumFramesPerSecond)")
@@ -1850,11 +2075,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         duration: 3600)
                 }
             }
+            // A resolution change (Displays settings) resizes the headset
+            // desktop; keep the window covering it and the mouse warp centered
+            if !self.runningInPreview, let vr = Self.findVRScreen(), self.window.frame != vr.frame {
+                self.window.setFrame(vr.frame, display: true)
+                let primaryHeight = NSScreen.screens[0].frame.height
+                self.renderer.overlay?.warpPoint = CGPoint(x: vr.frame.midX, y: primaryHeight - vr.frame.midY)
+            }
             guard let mode = CGDisplayCopyDisplayMode(self.headsetDisplayID) else { return }
             self.renderer.setPanelRate(hz: mode.refreshRate)
         }
         if vrScreen != nil {
             startWindowSweeper(vrScreen: screen)
+        }
+        if let layer = view.layer as? CAMetalLayer {
+            // Presentation now reads the layer directly, without MTKView.draw()
+            // applying its cached drawable configuration first.
+            layer.drawableSize = view.drawableSize
+            renderer.startRendering(layer: layer, displayID: displayID)
         }
 
         var linkOut: CVDisplayLink?
@@ -1871,10 +2109,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard shouldSchedule else { return kCVReturnSuccess }
 
                 DispatchQueue.main.async {
-                    self.playerView?.draw()
+                    // Allow one more scene update to queue while this one runs.
                     self.displayLinkLock.lock()
                     self.displayLinkDrawPending = false
                     self.displayLinkLock.unlock()
+                    if let view = self.playerView { self.renderer.draw(in: view) }
                 }
                 return kCVReturnSuccess
             }
@@ -2063,7 +2302,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         set("track", r.tracker.connected ? "yes" : "NO")
         set("pred", r.tracker.predictionEnabled ? "on" : "off")
-        set("look", "\(Int(r.tracker.extraLookaheadS * 1000)) ms")
+        set("look", r.poseLookaheadLabel)
         set("scan", r.scanlineEnabled ? "on" : "off")
         set("chrom", r.chromaticEnabled ? "on" : "off")
         set("vsync", ((playerView?.layer as? CAMetalLayer)?.displaySyncEnabled ?? true)
@@ -2169,15 +2408,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let renderer else { return }
         renderer.video?.stop()
         let vs = VideoSource(url: url, device: renderer.device)
-        vs.onBufferingChanged = { [weak renderer, weak vs] buffering in
-            guard let renderer, let vs, renderer.video === vs,
-                  renderer.passthrough?.active != true else { return }
-            if buffering {
-                renderer.overlay?.showOSD("Buffering from NAS…", duration: 3600)
-            } else {
-                renderer.overlay?.clearOSD(matching: "Buffering from NAS…")
-            }
-        }
         vs.onUnsupported = { [weak renderer] message in
             renderer?.overlay?.showOSD(message, duration: 8)
         }
@@ -2216,6 +2446,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let link = cvLink {
             CVDisplayLinkStop(link)
         }
+        renderer?.stopRendering()
         psvr2_stop()
     }
 }
@@ -2239,6 +2470,10 @@ if isatty(STDOUT_FILENO) == 0 {
 let args = CommandLine.arguments
 // With no argument, the file is chosen via the in-headset panel after launch
 let url: URL? = args.count > 1 ? URL(fileURLWithPath: args[1]) : nil
+
+// Before AppKit reads the screen layout, so the headset window is created
+// on the final desktop size
+HeadsetDisplayMode.useNativePixels()
 
 let app = PlayerApplication.shared
 app.setActivationPolicy(.regular)

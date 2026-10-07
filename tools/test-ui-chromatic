@@ -1,0 +1,7 @@
+#!/bin/zsh
+set -eu
+root=${0:A:h:h}
+test_dir=$(mktemp -d /private/tmp/psvr2-ui-chromatic.XXXXXX)
+trap 'rm -rf "$test_dir"' EXIT
+swiftc -module-cache-path "$test_dir/cache" "$root/tools/ui-chromatic-tests.swift" -o "$test_dir/tests"
+"$test_dir/tests" "${1:-$root/player/main.swift}"

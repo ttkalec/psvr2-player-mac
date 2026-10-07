@@ -17,9 +17,17 @@ final class VideoMetaCache {
     private var queued = Set<String>()
     private var queue: [URL] = []
     private var busy = false
+    private var revisions: [String: Int] = [:]
     var onUpdate: (() -> Void)?
 
     func meta(for url: URL) -> Meta? { cache[url.path] }
+
+    func invalidate(_ url: URL) {
+        cache[url.path] = nil
+        revisions[url.path, default: 0] += 1
+        queued.remove(url.path)
+        queue.removeAll { $0.path == url.path }
+    }
 
     // Queue a file for loading (repeated calls are ignored)
     func request(_ url: URL) {
@@ -43,6 +51,7 @@ final class VideoMetaCache {
     private func pump() {
         guard !busy, !queue.isEmpty else { return }
         let url = queue.removeFirst()
+        let revision = revisions[url.path, default: 0]
         busy = true
 
         Task.detached(priority: .utility) {
@@ -70,7 +79,10 @@ final class VideoMetaCache {
             let meta = Meta(thumb: thumb, durationS: duration, dims: dims)
             await MainActor.run { [weak self] in
                 guard let self else { return }
-                self.cache[url.path] = meta
+                if self.revisions[url.path, default: 0] == revision {
+                    self.cache[url.path] = meta
+                    self.queued.remove(url.path)
+                }
                 self.busy = false
                 self.onUpdate?()
                 self.pump()

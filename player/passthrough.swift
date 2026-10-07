@@ -55,7 +55,7 @@ final class PassthroughSource {
             pixelFormat: .bc4_rUnorm, width: Self.width, height: Self.height,
             mipmapped: false)
         desc.usage = [.shaderRead]
-        desc.storageMode = .managed
+        desc.storageMode = .shared
         textureL = device.makeTexture(descriptor: desc)
         textureR = device.makeTexture(descriptor: desc)
     }
@@ -84,7 +84,7 @@ final class PassthroughSource {
 
     // Called every render frame
     func update() {
-        guard active, let tl = textureL, let tr = textureR else { return }
+        guard active, let device = textureL?.device, textureR != nil else { return }
         var fresh: Int32 = 0
         bufL.withUnsafeMutableBufferPointer { l in
             bufR.withUnsafeMutableBufferPointer { r in
@@ -92,6 +92,15 @@ final class PassthroughSource {
             }
         }
         guard fresh == 1 else { return }
+
+        // As with the HUD, leave the textures in the previous render snapshot
+        // untouched until the GPU is finished with them.
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bc4_rUnorm, width: Self.width, height: Self.height, mipmapped: false)
+        desc.usage = [.shaderRead]
+        desc.storageMode = .shared
+        guard let tl = device.makeTexture(descriptor: desc),
+              let tr = device.makeTexture(descriptor: desc) else { return }
 
         // BC4: 4 bits per pixel, 4x4 block = 8 bytes -> block row = width*2 bytes
         let bytesPerRow = Self.width * 2
@@ -104,6 +113,8 @@ final class PassthroughSource {
             tr.replace(region: region, mipmapLevel: 0,
                        withBytes: $0.baseAddress!, bytesPerRow: bytesPerRow)
         }
+        textureL = tl
+        textureR = tr
         gotFrame = true
     }
 }

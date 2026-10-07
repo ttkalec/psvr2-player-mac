@@ -26,7 +26,7 @@ brick) bridges that gap. No software can work around it.
   from the [Monado](https://gitlab.freedesktop.org/monado/monado) driver,
   BSL-1.0)
 - Head tracking: the headset's on-board SLAM (~60 Hz) plus IMU integration
-  (2000 Hz) with extrapolation — honest 120 fps with no ghosting
+  (2000 Hz) with extrapolation, rendered at the headset's refresh rate
 - Per-scanline rolling-shutter compensation driven by the gyro
 - Projections: equirect 360°, half-equirect 180°, fisheye (adjustable FOV);
   SBS / top-bottom / mono stereo; auto-detected from the file name
@@ -103,6 +103,14 @@ Click **Shuffle** in the file picker's bottom row to randomize the videos in
 the current folder. Folders stay at the top. Click again for a new order;
 the order is remembered when you return to that folder during the same app session.
 
+Right-click a video in the HUD file picker to open its file actions. Choose
+**Delete** to permanently delete it from disk and remove its row. Each video
+also has a **Move** button, which moves it into the `!vr` folder beside its
+current folder, for example `vr_new/video.mp4` to `!vr/video.mp4`. The HUD
+reports an error if that folder is missing or the destination name is already
+taken. Both actions preserve the order of the remaining files after a shuffle.
+Moving a file also carries over its saved playback position.
+
 To open a specific file right away, pass it as an argument:
 
 ```sh
@@ -113,11 +121,39 @@ player/play "video_180_SBS.mp4"
 log goes to `~/Library/Logs/PSVR2Player.log` (watch with `tail -f` or
 Console.app).
 
-For stuttering, compare `[stat] fps` (headset redraws) with `[playback]
+macOS gives a newly connected headset a scaled "looks like 3200×1632"
+desktop, which composites a 6400×3264 framebuffer every refresh and resamples
+the lens-corrected image twice before it reaches the 4000×2040 panel. While
+the player runs it switches the headset to a mode on the panel's own pixel
+grid (2000×1020 HiDPI or 4000×2040, same refresh rate); macOS restores your
+mode when the player exits. Pick one of those for PS VR2 in Displays settings
+to skip the switch. An idle file picker reuses its HUD texture until its
+content or hovered button changes.
+Rendering uses a dedicated display thread paced by the headset's own clock.
+It samples head orientation just before encoding each frame and predicts to
+the refresh the frame will reach the panel on, plus panel scanout. Frames
+appear in order, one per refresh; when WindowServer misses a refresh, the
+queue stays a frame deeper (8.3 ms more delay at 120 Hz) until a display tick
+is skipped, so the prediction follows the newest presented frame through the
+frames still in flight. Video delivery and HUD updates publish a complete
+scene for that thread to reuse, so a delay in either can hold the video image
+without holding head tracking.
+
+For stuttering, compare `[stat] fps` (submitted headset frames) with `[playback]
 videoFPS` (distinct video frames delivered). A 60 fps video should deliver
 about 60 new frames per second during steady playback at 1×, even though
-the headset redraws at 120 Hz. `maxGap` records the longest interval without
-a new frame while playing; `copyMax` measures the longest video-output fetch.
+the headset redraws at 120 Hz. In `[stat]`, `drawGapMax` measures the longest
+gap between frame submissions, `cpuMax` the longest render-thread encoding
+call, and `gpuMax` the longest completed GPU frame. `presentFPS` and
+`presentGapMax` use Metal's reported presentation times; `dropped` counts
+callbacks that report a discarded drawable. `mispredicted=N/M` counts the
+presented frames that reached the panel on a different refresh than their
+head pose was predicted for; each one is off by head speed × one refresh
+(a 1.7° jump during a 200°/s turn at 120 Hz). A refresh WindowServer misses
+costs that frame and the three rendered before the miss is reported, so a
+few per report are normal. At 120 Hz, one refresh takes 8.3 ms.
+`[playback] maxGap` records the longest interval without a new frame while
+playing; `copyMax` measures the longest video-output fetch.
 Seek requests and completion times are logged separately. Pausing, starting,
 and seeking can lower the counts in the surrounding two-second report.
 
@@ -132,10 +168,10 @@ keeps supplying both audio and video during sustained playback.
 Only one decoder seek runs at a time; rapid inputs replace the queued target.
 Seeking prioritizes the new requests and stops scheduling old read-ahead.
 An SMB read already in progress must finish before the next one starts.
-The headset shows "Buffering from NAS…" when video delivery waits, and the
-remote window also reports buffering. A seek can still pause briefly while
-the decoder restarts. `[nas]` logs show cache usage, active read speed, longest
-read, and cache hits/misses. The read speed includes OS-cached reads and is
+The remote window reports buffering without a headset popup. A seek can
+still pause briefly while the decoder restarts. `[nas]` logs show cache usage,
+active read speed, longest read, and cache hits/misses. The read speed includes
+OS-cached reads and is
 not a measurement of physical network throughput. The RAM limit applies to
 the app's compressed-data cache; AVFoundation and rendering use extra memory.
 
@@ -150,6 +186,21 @@ temporary video of about 700 MB with continuous audio, exceeds the RAM cache,
 and verifies decoded audio and video for 65 seconds. Audio output stays silent
 during this test. It requires ffmpeg and an available macOS audio output.
 
+Run `tools/test-picker-files` to check file deletion, moves into `!vr`, failed
+moves, and shuffled list updates using temporary files.
+
+Run `tools/test-rendering` to check presentation-time prediction and verify
+that the production renderer keeps sampling a simulated moving headset
+during a 250 ms main-thread stall. It requires Metal and a desktop session,
+briefly shows a small test window, and never opens USB. It also checks render
+thread shutdown.
+Use `--headset` for a connected PS VR2 at panel resolution, `--foreground`
+to activate the test window temporarily, and `--video /path/to/video.mp4`
+to include decoded video. Test audio is muted.
+
+Run `tools/test-ui-chromatic` on a Mac with Metal available to check per-color
+lens correction for the HUD and cursor, including transparent edges in both eyes.
+
 In macOS Settings, set the "PS VR2" display to 120 Hz.
 
 Keys: `Space` pause/resume, once per press while the app is active ·
@@ -162,16 +213,23 @@ an uncomfortably close scene away; separate from camera convergence) ·
 `←/→` ±15 s · `↑/↓` volume ·
 `+/-` fisheye FOV or camera lens angle · `Q` quit.
 Mouse: move — panel · click — select · right-drag — tilt scene ·
-wheel — scroll list. Trackpad: two-finger scroll — list, two-finger
+right-click a video — file actions · wheel — scroll list. Trackpad: two-finger scroll — list, two-finger
 press-drag — tilt scene.
 Debug: `P` pose prediction · `[`/`]` look-ahead · `S` scanline correction ·
 `C` chromatic correction · `D` vsync.
+
+Chromatic correction is enabled by default for video and the entire HUD,
+including text, status messages, and the cursor. If text has colored fringes
+away from the center, confirm that the remote window shows **Chromatic: on**.
+Press `C` to compare correction on and off. Restart after updating the player
+to load the rebuilt shader.
 
 ## Layout
 
 - `player/` — the player itself: `main.swift` (AppKit + Metal +
   AVFoundation + the shader), `overlay.swift` (in-headset panel and file
-  picker), `nas.swift` (network-file read-ahead), `seeking.swift` (queued seeks),
+  picker), `files.swift` (file actions and shuffled lists), `nas.swift` (network-file read-ahead), `seeking.swift` (queued seeks),
+  `rendering.swift` (Metal display link thread, scene publication and pose timing),
   `meta.swift` (thumbnail/metadata cache), `sweeper.swift` (moves stray windows
   off the headset display), `passthrough.swift` (camera frames
   to BC4 textures), `cpsvr2.c` (SLAM/IMU/status/camera streams over libusb),
