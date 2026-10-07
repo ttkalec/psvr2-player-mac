@@ -201,6 +201,11 @@ to include decoded video. Test audio is muted.
 Run `tools/test-ui-chromatic` on a Mac with Metal available to check per-color
 lens correction for the HUD and cursor, including transparent edges in both eyes.
 
+Run `tools/test-shader-speedups` to check the shader's shortcuts on the GPU:
+the polynomial `atan2`/`asin` against double precision, and the HUD's
+green-ray pre-test against compositing every ray, with the real lens table
+at head poses up to the panel's re-anchor limit and any roll.
+
 In macOS Settings, set the "PS VR2" display to 120 Hz.
 
 Keys: `Space` pause/resume, once per press while the app is active ·

@@ -53,6 +53,39 @@ constant float FX = 0.3585564;
 constant float FY = 0.3762281;
 constant float PI = 3.14159265358979;
 
+// Polynomial arctangent and arcsine, cheaper than the library versions that
+// run three times per pixel. Measured on the GPU against double precision:
+// atan2 2e-6 rad, asin 4e-6 rad (float input rounding near the poles, same
+// as the library); a pixel of 8K 360° video spans 8.2e-4 rad.
+static float atan_unit(float x) {
+    float z = x * x;
+    return x * (0.99997726 + z * (-0.33262347 + z * (0.19354346
+        + z * (-0.11643287 + z * (0.05265332 + z * -0.01172120)))));
+}
+
+static float atan2_poly(float y, float x) {
+    float ax = fabs(x);
+    float ay = fabs(y);
+    float a = atan_unit(min(ax, ay) / max(max(ax, ay), 1e-20));
+    if (ay > ax) { a = PI * 0.5 - a; }
+    if (x < 0.0) { a = PI - a; }
+    return y < 0.0 ? -a : a;
+}
+
+static float asin_poly(float x) {
+    float ax = min(fabs(x), 1.0);
+    float p = -0.0012624911;
+    p = p * ax + 0.0066700901;
+    p = p * ax - 0.0170881256;
+    p = p * ax + 0.0308918810;
+    p = p * ax - 0.0501743046;
+    p = p * ax + 0.0889789874;
+    p = p * ax - 0.2145988016;
+    p = p * ax + 1.5707963050;
+    float a = PI * 0.5 - sqrt(1.0 - ax) * p;
+    return x < 0.0 ? -a : a;
+}
+
 static float2 project_dir(float3 w, int mode, int stereo, int eye, float fovRad, float shift, thread bool &valid) {
     float u, v;
     valid = true;
@@ -68,8 +101,8 @@ static float2 project_dir(float3 w, int mode, int stereo, int eye, float fovRad,
         u = 0.5 + r * d.x;
         v = 0.5 - r * d.y;
     } else {
-        float lon = atan2(w.x, -w.z);
-        float lat = asin(clamp(w.y, -1.0, 1.0));
+        float lon = atan2_poly(w.x, -w.z);
+        float lat = asin_poly(w.y);
         if (mode == 1) {
             // half-equirect 180°
             if (fabs(lon) > PI * 0.5) { valid = false; return float2(0.0); }
@@ -90,6 +123,18 @@ static float2 project_dir(float3 w, int mode, int stereo, int eye, float fovRad,
         v = v * 0.5 + (eye == 1 ? 0.5 : 0.0);
     }
     return float2(u, v);
+}
+
+// Panel-texture position of a ray given in the eye's distorted tan space
+// (a, b), without the video flip. False when it points away from the panel.
+static bool panel_uv(float a, float b, float k3, float k4, float disp,
+                     constant Uniforms &uni, thread float2 &puv) {
+    float3 wDir = (uni.rot * float4(k3 * a - k4 * b, -(k4 * a + k3 * b), -1.0, 0.0)).xyz;
+    float3 pDir = (uni.panelInv * float4(wDir, 0.0)).xyz;
+    if (pDir.z >= -1e-3) { return false; }
+    puv = float2((pDir.x / -pDir.z - disp - uni.p3.x) / (2.0 * uni.p3.z) + 0.5,
+                 (pDir.y / -pDir.z - uni.p3.y) / (2.0 * uni.p3.w) + 0.5);
+    return true;
 }
 
 // Frames come in native YUV 4:2:0 (a third of the memory of BGRA: critical
@@ -185,8 +230,9 @@ fragment float4 fs_main(VSOut in [[stage_in]],
             continue;
         }
 
-        float3 dir = normalize(float3(tanx, -tanyDown * flipV, -1.0));
-        float3 w = (uni.rot * float4(dir, 0.0)).xyz;
+        // Rotation keeps length and the scanline step scales with it, so a
+        // single normalize at the end gives the same direction.
+        float3 w = (uni.rot * float4(tanx, -tanyDown * flipV, -1.0, 0.0)).xyz;
         w = normalize(w + cross(gyroW, w) * rowTime);
 
         // p6.y — video depth: per-eye shift, mirrored between the eyes;
@@ -258,44 +304,44 @@ fragment float4 fs_main(VSOut in [[stage_in]],
     // by the current pose into world space, then into panel space, without the
     // video flip. Sample and composite each color along its own corrected ray,
     // including alpha and the cursor, so text edges align through the lenses.
-    for (int ch = chFrom; uni.p2.y > 0.5 && ch <= chTo; ch++) {
-        float ny = local_y + (ch == 1 ? -0.0002302693 : 0.0);
-        float a = local_x * scale[ch];
-        float b = ny * scale[ch];
-        float panelTanX = k3 * a - k4 * b;
-        float panelTanUp = -(k4 * a + k3 * b);
+    // Most of the view is outside the panel: test the green ray first. For
+    // any head pose before the panel re-anchors (~70°, any roll), red and
+    // blue land within 0.09 (u) and 0.15 (v) of green; the margins below
+    // are over twice that, so skipping here never clips the panel.
+    float disp = eye == 0 ? 0.021 : -0.021;
+    float2 greenUV;
+    bool nearPanel = uni.p2.y > 0.5
+        && panel_uv(local_x * scale[1], (local_y - 0.0002302693) * scale[1], k3, k4, disp, uni, greenUV)
+        && greenUV.x >= -0.25 && greenUV.x <= 1.25 && greenUV.y >= -0.45 && greenUV.y <= 1.45;
+    for (int ch = chFrom; nearPanel && ch <= chTo; ch++) {
+        float2 puv = greenUV;
+        if (ch != 1 && !panel_uv(local_x * scale[ch], local_y * scale[ch], k3, k4, disp, uni, puv)) {
+            continue;
+        }
+        float pu = puv.x;
+        float pv = puv.y;
+        // Margin around the panel (values match UIOverlay.marginU/V):
+        // the cursor may go past the edge, clicking there hides the panel;
+        // the texture edge is transparent, so clamp_to_edge doesn't smear
+        if (pu >= -0.05 && pu <= 1.05 && pv >= -0.10 && pv <= 1.10) {
+            float2 tuv = float2(pu, 1.0 - pv);
+            float4 uiC = ui.sample(smp, tuv);
 
-        float3 wDir = (uni.rot * float4(panelTanX, panelTanUp, -1.0, 0.0)).xyz;
-        float3 pDir = (uni.panelInv * float4(wDir, 0.0)).xyz;
-        if (pDir.z < -1e-3) {
-            float disp = eye == 0 ? 0.021 : -0.021;
-            float2 pc = uni.p3.xy;
-            float2 ph = uni.p3.zw;
-            float pu = (pDir.x / -pDir.z - disp - pc.x) / (2.0 * ph.x) + 0.5;
-            float pv = (pDir.y / -pDir.z - pc.y) / (2.0 * ph.y) + 0.5;
-            // Margin around the panel (values match UIOverlay.marginU/V):
-            // the cursor may go past the edge, clicking there hides the panel;
-            // the texture edge is transparent, so clamp_to_edge doesn't smear
-            if (pu >= -0.05 && pu <= 1.05 && pv >= -0.10 && pv <= 1.10) {
-                float2 tuv = float2(pu, 1.0 - pv);
-                float4 uiC = ui.sample(smp, tuv);
+            // Virtual cursor: white dot with a dark outline
+            float2 dvec = (tuv - uni.p2.zw) * float2(2.0, 1.0); // panel aspect 2:1
+            float dcur = length(dvec);
+            if (dcur < 0.014) {
+                uiC = float4(1.0, 1.0, 1.0, 1.0);
+            } else if (dcur < 0.020) {
+                uiC = float4(0.0, 0.0, 0.0, 1.0);
+            }
 
-                // Virtual cursor: white dot with a dark outline
-                float2 dvec = (tuv - uni.p2.zw) * float2(2.0, 1.0); // panel aspect 2:1
-                float dcur = length(dvec);
-                if (dcur < 0.014) {
-                    uiC = float4(1.0, 1.0, 1.0, 1.0);
-                } else if (dcur < 0.020) {
-                    uiC = float4(0.0, 0.0, 0.0, 1.0);
-                }
-
-                // The texture has premultiplied alpha. Its coverage must come
-                // from the same ray as the color, especially at text edges.
-                if (chromatic) {
-                    rgb[ch] = rgb[ch] * (1.0 - uiC.a) + uiC[ch];
-                } else {
-                    rgb = rgb * (1.0 - uiC.a) + uiC.rgb;
-                }
+            // The texture has premultiplied alpha. Its coverage must come
+            // from the same ray as the color, especially at text edges.
+            if (chromatic) {
+                rgb[ch] = rgb[ch] * (1.0 - uiC.a) + uiC[ch];
+            } else {
+                rgb = rgb * (1.0 - uiC.a) + uiC.rgb;
             }
         }
     }
