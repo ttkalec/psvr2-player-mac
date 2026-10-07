@@ -2567,6 +2567,15 @@ setbuf(stderr, nil)
 // Watch it: tail -f ~/Library/Logs/PSVR2Player.log or the Console app
 if isatty(STDOUT_FILENO) == 0 {
     let logPath = ("~/Library/Logs/PSVR2Player.log" as NSString).expandingTildeInPath
+    // Keep the previous five runs (PSVR2Player.1.log is the newest) so
+    // sessions in different setups can be compared afterwards
+    let files = FileManager.default
+    let base = (logPath as NSString).deletingPathExtension
+    try? files.removeItem(atPath: "\(base).5.log")
+    for n in stride(from: 4, through: 1, by: -1) {
+        try? files.moveItem(atPath: "\(base).\(n).log", toPath: "\(base).\(n + 1).log")
+    }
+    try? files.moveItem(atPath: logPath, toPath: "\(base).1.log")
     freopen(logPath, "w", stdout)
     freopen(logPath, "a", stderr)
     setbuf(stdout, nil)

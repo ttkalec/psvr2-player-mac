@@ -121,7 +121,15 @@ player/play "video_180_SBS.mp4"
 
 `play` keeps the log in your terminal; when launched from Finder/Dock the
 log goes to `~/Library/Logs/PSVR2Player.log` (watch with `tail -f` or
-Console.app).
+Console.app). The five previous runs are kept as `PSVR2Player.1.log` (newest)
+to `PSVR2Player.5.log`.
+
+To compare setups (other displays connected or not, 90 vs 120 Hz), use the
+headset for a minute or two in each, then run `tools/stat-summary`. It lists
+each run's refresh rate, refreshes WindowServer missed per second (each one
+is a hitch during head motion), and the share of frames shown on another
+refresh than their head pose was predicted for. Startup, mode switches and
+pauses are left out.
 
 macOS gives a newly connected headset a scaled "looks like 3200×1632"
 desktop, which composites a 6400×3264 framebuffer every refresh and resamples

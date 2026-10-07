@@ -1,0 +1,37 @@
+#!/bin/zsh
+# Summarize headset frame pacing per player run, for comparing setups
+# (other displays connected or not, 90 vs 120 Hz). Usage:
+#   tools/stat-summary [log ...]   (default: the current and five previous runs)
+set -eu
+logs=("$@")
+if (( ${#logs} == 0 )); then
+    for f in ~/Library/Logs/PSVR2Player.log ~/Library/Logs/PSVR2Player.{1..5}.log; do
+        [[ -f $f ]] && logs+=$f
+    done
+fi
+for log in $logs; do
+    awk -v name="${log:t}" '
+        /^\[player\] Started/ { started = $3 " " $4 }
+        /panel mode [0-9]+ Hz/ { match($0, /mode [0-9]+/); hz = substr($0, RSTART + 5, RLENGTH - 5) + 0; skip = 2 }
+        /Headset display refresh rate per CoreGraphics/ { match($0, /: [0-9.]+ Hz/); hz = substr($0, RSTART + 2, RLENGTH - 5) + 0; skip = 2 }
+        /^\[stat\]/ {
+            if (hz == 0) hz = 120
+            # Skip startup, mode switches and stalls (pauses, file loads)
+            if (skip > 0) { skip--; next }
+            match($0, /presentGapMax=[0-9.]+/); gap = substr($0, RSTART + 14, RLENGTH - 14) + 0
+            if (gap > 100) next
+            match($0, /presentFPS=[0-9.]+/); fps = substr($0, RSTART + 11, RLENGTH - 11) + 0
+            match($0, /mispredicted=[0-9]+\/[0-9]+/); split(substr($0, RSTART + 13, RLENGTH - 13), m, "/")
+            key = hz
+            seconds[key] += 2; missed[key] += (hz - fps) * 2; bad[key] += m[1]; total[key] += m[2]
+            if (gap > 1500 / hz) hitchy[key]++
+            reports[key]++
+        }
+        END {
+            for (key in seconds) {
+                printf "%-20s %s  %3d Hz  %4.0f s  missed refreshes %.2f/s  mispredicted %.1f%%  reports with a miss %d/%d\n",
+                    name, started, key, seconds[key], missed[key] / seconds[key],
+                    total[key] ? 100 * bad[key] / total[key] : 0, hitchy[key], reports[key]
+            }
+        }' "$log"
+done
