@@ -27,6 +27,7 @@ int psvr2_get_status(int *prox, int *ipd) { *prox = 1; *ipd = 63; return 0; }
 int psvr2_get_motion(float g[3], double *age) {
     g[0] = g[2] = 0; g[1] = 1; *age = 0.001; return 1;
 }
+int psvr2_get_fusion_status(float *bias, float *correction) { *bias = 0; *correction = 0; return 1; }
 int psvr2_get_button(void) { return 0; }
 int psvr2_set_brightness(float value) { (void)value; return 0; }
 int psvr2_get_distortion_calibration(float out[8]) { (void)out; return -1; }

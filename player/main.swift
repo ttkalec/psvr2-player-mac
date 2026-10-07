@@ -1635,9 +1635,15 @@ final class Renderer: NSObject, MTKViewDelegate {
             // mispredicted: frames shown on another refresh than their pose
             // was predicted for (each one jumps by head speed x 8 ms)
             let timing = frameDriver?.schedule.takeStats() ?? (frames: 0, mispredicted: 0)
-            print(String(format: "[stat] fps=%.1f presentFPS=%.1f presentGapMax=%.1fms dropped=%d mispredicted=%d/%d gpu=%.2fms gpuMax=%.2fms drawGapMax=%.1fms cpuMax=%.1fms mem=%.0fMB",
+            // Head tracking: learned gyro bias and the largest SLAM pose
+            // difference before smoothing (fusion.c)
+            var gyroBias: Float = 0
+            var slamCorrection: Float = 0
+            psvr2_get_fusion_status(&gyroBias, &slamCorrection)
+            print(String(format: "[stat] fps=%.1f presentFPS=%.1f presentGapMax=%.1fms dropped=%d mispredicted=%d/%d gpu=%.2fms gpuMax=%.2fms drawGapMax=%.1fms cpuMax=%.1fms gyroBias=%.1fdeg/s slamCorrMax=%.2fdeg mem=%.0fMB",
                 fps, presentFPS, presentGapMs, dropped, timing.mispredicted, timing.frames,
-                gpuMs, gpuMaxMs, statMaxGap * 1000, statCpuMax * 1000, Self.memoryFootprintMB()))
+                gpuMs, gpuMaxMs, statMaxGap * 1000, statCpuMax * 1000, gyroBias, slamCorrection,
+                Self.memoryFootprintMB()))
             statFrames = 0
             statMaxGap = 0
             statCpuMax = 0

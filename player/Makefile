@@ -6,14 +6,17 @@ APP = PSVR2Player.app
 
 all: $(APP)
 
-cpsvr2.o: cpsvr2.c cpsvr2.h
+cpsvr2.o: cpsvr2.c cpsvr2.h fusion.h
 	clang -O2 -Wall $(LIBUSB_CFLAGS) -c cpsvr2.c -o cpsvr2.o
 
 lut.o: lut.c
 	clang -O2 -c lut.c -o lut.o
 
-psvr2player: main.swift overlay.swift files.swift rendering.swift sweeper.swift meta.swift passthrough.swift nas.swift seeking.swift cpsvr2.o lut.o cpsvr2.h
-	swiftc -O -import-objc-header cpsvr2.h main.swift overlay.swift files.swift rendering.swift sweeper.swift meta.swift passthrough.swift nas.swift seeking.swift cpsvr2.o lut.o \
+fusion.o: fusion.c fusion.h
+	clang -O2 -Wall -c fusion.c -o fusion.o
+
+psvr2player: main.swift overlay.swift files.swift rendering.swift sweeper.swift meta.swift passthrough.swift nas.swift seeking.swift cpsvr2.o fusion.o lut.o cpsvr2.h
+	swiftc -O -import-objc-header cpsvr2.h main.swift overlay.swift files.swift rendering.swift sweeper.swift meta.swift passthrough.swift nas.swift seeking.swift cpsvr2.o fusion.o lut.o \
 		$(LIBUSB_LDFLAGS) \
 		-framework AppKit -framework Metal -framework MetalKit \
 		-framework AVFoundation -framework CoreAudio -framework CoreVideo \
@@ -30,6 +33,6 @@ $(APP): psvr2player Info.plist environment.jpg
 	@echo "Done: $(APP) — run ./play [file]"
 
 clean:
-	rm -rf psvr2player cpsvr2.o lut.o $(APP)
+	rm -rf psvr2player cpsvr2.o fusion.o lut.o $(APP)
 
 .PHONY: all clean

@@ -1,0 +1,7 @@
+#!/bin/zsh
+set -eu
+root=${0:A:h:h}
+test_dir=$(mktemp -d /private/tmp/psvr2-fusion.XXXXXX)
+trap 'rm -rf "$test_dir"' EXIT
+clang -O2 -Wall -I"$root/player" "$root/tools/fusion-tests.c" "$root/player/fusion.c" -o "$test_dir/tests"
+"$test_dir/tests"

@@ -3,6 +3,7 @@
  * Monado driver (BSL-1.0): src/xrt/drivers/psvr2.
  */
 #include "cpsvr2.h"
+#include "fusion.h"
 
 #include <libusb.h>
 #include <math.h>
@@ -77,7 +78,6 @@ static float g_quat[4];
 static float g_pos[3];
 static float g_gyro[3];
 static double g_slam_time;
-static uint32_t g_slam_vts;
 static double g_imu_time;
 static int g_proximity;
 static int g_function_button;
@@ -92,50 +92,11 @@ static unsigned char *g_camera_frame; /* two BC4 planes back to back */
 static int g_camera_seq;              /* grows with every received frame */
 static int g_camera_seq_taken;
 
-/* IMU ring buffer: ~130 ms of history at 2000 Hz */
-#define IMU_RING_SIZE 256
+/* Gyro integration corrected toward SLAM poses (see fusion.c) */
 #define IMU_DT 0.0005f
-struct imu_sample {
-	uint32_t vts_us;
-	float gyro[3];
-};
-static struct imu_sample g_imu_ring[IMU_RING_SIZE];
-static int g_imu_head; /* index of the next write */
-static int g_imu_count;
-
-/* Quaternions in w,x,y,z order */
-static void quat_mul(const float a[4], const float b[4], float out[4])
-{
-	float w = a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3];
-	float x = a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2];
-	float y = a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1];
-	float z = a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0];
-	out[0] = w;
-	out[1] = x;
-	out[2] = y;
-	out[3] = z;
-}
-
-/* Rotation by the angular-velocity vector over dt (quaternion exponential) */
-static void quat_from_gyro(const float gyro[3], float dt, float out[4])
-{
-	float hx = gyro[0] * dt * 0.5f;
-	float hy = gyro[1] * dt * 0.5f;
-	float hz = gyro[2] * dt * 0.5f;
-	float angle = sqrtf(hx * hx + hy * hy + hz * hz);
-	if (angle < 1e-9f) {
-		out[0] = 1.0f;
-		out[1] = hx;
-		out[2] = hy;
-		out[3] = hz;
-		return;
-	}
-	float s = sinf(angle) / angle;
-	out[0] = cosf(angle);
-	out[1] = hx * s;
-	out[2] = hy * s;
-	out[3] = hz * s;
-}
+static struct fusion_state g_fusion;
+/* Largest SLAM difference since the last status read, radians */
+static float g_max_correction;
 
 static double monotonic_s(void)
 {
@@ -178,7 +139,13 @@ static void *slam_thread_fn(void *arg)
 		}
 		memcpy(g_pos, rec.pos, sizeof(g_pos));
 		g_slam_time = monotonic_s();
-		g_slam_vts = rec.vts_ts_us;
+		/* Bring the SLAM quaternion into the gyro's Monado-mapped axes
+		 * (as in process_slam_record) */
+		float mapped[4] = {g_quat[0], -g_quat[2], -g_quat[1], g_quat[3]};
+		fusion_slam(&g_fusion, rec.vts_ts_us, mapped);
+		if (g_fusion.last_error > g_max_correction) {
+			g_max_correction = g_fusion.last_error;
+		}
 		g_have_pose = 1;
 		pthread_mutex_unlock(&g_lock);
 	}
@@ -215,17 +182,13 @@ static void *status_thread_fn(void *arg)
 			memcpy(&imu, buf + sizeof(*hdr) + i * sizeof(imu), sizeof(imu));
 
 			/* Axis mapping as in Monado process_imu_record */
-			struct imu_sample *s = &g_imu_ring[g_imu_head];
-			s->vts_us = imu.vts_us;
-			s->gyro[0] = -DEG_TO_RAD(imu.gyro[1] * GYRO_SCALE);
-			s->gyro[1] = DEG_TO_RAD(imu.gyro[2] * GYRO_SCALE);
-			s->gyro[2] = -DEG_TO_RAD(imu.gyro[0] * GYRO_SCALE);
-			memcpy(g_gyro, s->gyro, sizeof(g_gyro));
-
-			g_imu_head = (g_imu_head + 1) % IMU_RING_SIZE;
-			if (g_imu_count < IMU_RING_SIZE) {
-				g_imu_count++;
-			}
+			float gyro[3] = {
+				-DEG_TO_RAD(imu.gyro[1] * GYRO_SCALE),
+				DEG_TO_RAD(imu.gyro[2] * GYRO_SCALE),
+				-DEG_TO_RAD(imu.gyro[0] * GYRO_SCALE),
+			};
+			fusion_imu(&g_fusion, imu.vts_us, gyro, IMU_DT);
+			memcpy(g_gyro, g_fusion.rate, sizeof(g_gyro));
 		}
 		if (n_imu > 0) {
 			g_imu_time = monotonic_s();
@@ -351,6 +314,8 @@ int psvr2_start(void)
 	}
 
 	g_have_pose = 0;
+	fusion_reset(&g_fusion);
+	g_max_correction = 0;
 	g_running = 1;
 	pthread_create(&g_slam_thread, NULL, slam_thread_fn, NULL);
 	pthread_create(&g_status_thread, NULL, status_thread_fn, NULL);
@@ -413,48 +378,29 @@ int psvr2_get_motion(float gyro_radps[3], double *slam_age_s)
 int psvr2_get_predicted_quat(float lookahead_s, float out_wxyz[4])
 {
 	pthread_mutex_lock(&g_lock);
-	if (!g_have_pose) {
+	if (!g_have_pose || !g_fusion.initialized) {
 		pthread_mutex_unlock(&g_lock);
 		return 0;
 	}
-
-	/* Integrate IMU samples newer than the SLAM pose (shared VTS timescale, us).
-	 * Unsigned subtraction handles counter wraparound correctly. */
-	float delta[4] = {1, 0, 0, 0};
-	int idx = (g_imu_head - g_imu_count + IMU_RING_SIZE) % IMU_RING_SIZE;
-	for (int n = 0; n < g_imu_count; n++) {
-		struct imu_sample *s = &g_imu_ring[idx];
-		idx = (idx + 1) % IMU_RING_SIZE;
-		if ((int32_t)(s->vts_us - g_slam_vts) <= 0) {
-			continue;
-		}
-		float dq[4];
-		quat_from_gyro(s->gyro, IMU_DT, dq);
-		quat_mul(delta, dq, delta);
-	}
-
-	/* Remainder: from the last IMU sample to the current frame + lookahead */
-	double tail = monotonic_s() - g_imu_time + (double)lookahead_s;
-	if (tail < 0.0) tail = 0.0;
-	if (tail > 0.1) tail = 0.1;
-	float dq[4];
-	quat_from_gyro(g_gyro, (float)tail, dq);
-	quat_mul(delta, dq, delta);
-
-	/* The delta is integrated in Monado-mapped axes — bring the SLAM quaternion
-	 * into the same axes (as in process_slam_record) before multiplying */
-	float mapped[4] = {g_quat[0], -g_quat[2], -g_quat[1], g_quat[3]};
-	quat_mul(mapped, delta, out_wxyz);
-
-	float len = sqrtf(out_wxyz[0] * out_wxyz[0] + out_wxyz[1] * out_wxyz[1] +
-	                  out_wxyz[2] * out_wxyz[2] + out_wxyz[3] * out_wxyz[3]);
-	if (len > 1e-6f) {
-		for (int i = 0; i < 4; i++) {
-			out_wxyz[i] /= len;
-		}
-	}
+	/* From the newest IMU sample to the requested time */
+	double ahead = monotonic_s() - g_imu_time + (double)lookahead_s;
+	if (ahead < 0.0) ahead = 0.0;
+	if (ahead > 0.1) ahead = 0.1;
+	fusion_predict(&g_fusion, (float)ahead, out_wxyz);
 	pthread_mutex_unlock(&g_lock);
 	return 1;
+}
+
+int psvr2_get_fusion_status(float *bias_dps, float *max_correction_deg)
+{
+	pthread_mutex_lock(&g_lock);
+	const float *b = g_fusion.bias;
+	*bias_dps = sqrtf(b[0] * b[0] + b[1] * b[1] + b[2] * b[2]) * 180.0f / (float)M_PI;
+	*max_correction_deg = g_max_correction * 180.0f / (float)M_PI;
+	g_max_correction = 0;
+	int ready = g_fusion.initialized;
+	pthread_mutex_unlock(&g_lock);
+	return ready;
 }
 
 int psvr2_get_button(void)

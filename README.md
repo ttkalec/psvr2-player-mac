@@ -25,8 +25,10 @@ brick) bridges that gap. No software can work around it.
   correction using the factory calibration of your specific headset (protocol
   from the [Monado](https://gitlab.freedesktop.org/monado/monado) driver,
   BSL-1.0)
-- Head tracking: the headset's on-board SLAM (~60 Hz) plus IMU integration
-  (2000 Hz) with extrapolation, rendered at the headset's refresh rate
+- Head tracking: the gyro (2000 Hz) integrated continuously, with its bias
+  learned online and blended toward the headset's on-board SLAM poses
+  (~60 Hz) instead of jumping to each one; extrapolated to the moment each
+  frame reaches the panel, rendered at the headset's refresh rate
 - Per-scanline rolling-shutter compensation driven by the gyro
 - Projections: equirect 360°, half-equirect 180°, fisheye (adjustable FOV);
   SBS / top-bottom / mono stereo; auto-detected from the file name
@@ -157,6 +159,10 @@ head pose was predicted for; each one is off by head speed × one refresh
 (a 1.7° jump during a 200°/s turn at 120 Hz). A refresh WindowServer misses
 costs that frame and the three rendered before the miss is reported, so a
 few per report are normal. At 120 Hz, one refresh takes 8.3 ms.
+`gyroBias` is the learned gyro bias (about 3.3°/s on one headset; it
+settles within a few seconds of launch), and `slamCorrMax` the largest
+difference between a SLAM pose and the integrated gyro before blending.
+At rest it should stay near 0.00°; the first report includes startup.
 `[playback] maxGap` records the longest interval without a new frame while
 playing; `copyMax` measures the longest video-output fetch.
 Seek requests and completion times are logged separately. Pausing, starting,
@@ -209,6 +215,11 @@ lens correction for the HUD and cursor, including transparent edges in both eyes
 Run `tools/test-audio-output` to check that the headset audio check answers
 within half a second without blocking the main thread, for both a running and
 a missing output.
+
+Run `tools/test-fusion` to check head-orientation fusion against a simulated
+head with the headset's gyro bias, a 2% gyro scale error, +-0.4 ms
+IMU/SLAM clock offsets and late SLAM poses: it must be smoother than
+restarting at each SLAM pose and about as accurate.
 
 Run `tools/test-shader-speedups` to check the shader's shortcuts on the GPU:
 the polynomial `atan2`/`asin` against double precision, and the HUD's

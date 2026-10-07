@@ -21,16 +21,20 @@ int psvr2_get_pose(float quat_wxyz[4], float pos_xyz[3]);
 /* Proximity sensor (headset is worn) and IPD in mm. */
 int psvr2_get_status(int *proximity, int *ipd_mm);
 
-/* Angular velocity (rad/s, axes match the quaternion after Monado mapping)
- * and the age of the last SLAM pose in seconds — for prediction. */
+/* Bias-corrected angular velocity (rad/s, axes match the quaternion after
+ * Monado mapping) and the age of the last SLAM pose in seconds. */
 int psvr2_get_motion(float gyro_radps[3], double *slam_age_s);
 
-/* Predicted quaternion: the last SLAM pose, integrated forward with all
- * IMU samples after it (by shared VTS timestamps) plus extrapolation
- * lookahead_s ahead. The quaternion is ALREADY in Monado-mapped axes
- * (x-right, y-up, -z-forward before the 90-degree correction); no remap
- * needed in the caller. Returns 1 if the pose is valid. */
+/* Predicted quaternion: the gyro-integrated orientation, corrected toward
+ * SLAM poses (fusion.c), extrapolated lookahead_s ahead. The quaternion is
+ * ALREADY in Monado-mapped axes (x-right, y-up, -z-forward before the
+ * 90-degree correction); no remap needed in the caller. Returns 1 if the
+ * pose is valid. */
 int psvr2_get_predicted_quat(float lookahead_s, float out_wxyz[4]);
+
+/* Estimated gyro bias (deg/s) and the largest SLAM correction (deg) since
+ * the previous call. Returns 1 once fusion has a pose. */
+int psvr2_get_fusion_status(float *bias_dps, float *max_correction_deg);
 
 /* Fn button on the headset: 1 — pressed. */
 int psvr2_get_button(void);
