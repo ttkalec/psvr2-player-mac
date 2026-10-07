@@ -123,12 +123,17 @@ Console.app).
 
 macOS gives a newly connected headset a scaled "looks like 3200×1632"
 desktop, which composites a 6400×3264 framebuffer every refresh and resamples
-the lens-corrected image twice before it reaches the 4000×2040 panel. While
-the player runs it switches the headset to a mode on the panel's own pixel
-grid (2000×1020 HiDPI or 4000×2040, same refresh rate); macOS restores your
-mode when the player exits. Pick one of those for PS VR2 in Displays settings
-to skip the switch. An idle file picker reuses its HUD texture until its
-content or hovered button changes.
+the lens-corrected image twice before it reaches the 4000×2040 panel. Pick
+2000×1020 or 4000×2040 for PS VR2 in Displays settings (the log reminds you
+when it is scaled). The player does not switch modes itself: display
+reconfigurations can wedge the headset's DisplayPort audio until the headset
+is reconnected. An idle file picker reuses its HUD texture until its content
+or hovered button changes.
+
+Before routing sound to the headset, the player checks on a background thread
+that its audio output actually runs. A wedged output would otherwise freeze
+the app for seconds and stop the video clock. If the check fails, playback
+uses the Mac's output and the HUD says to reconnect the headset.
 Rendering uses a dedicated display thread paced by the headset's own clock.
 It samples head orientation just before encoding each frame and predicts to
 the refresh the frame will reach the panel on, plus panel scanout. Frames
@@ -200,6 +205,10 @@ to include decoded video. Test audio is muted.
 
 Run `tools/test-ui-chromatic` on a Mac with Metal available to check per-color
 lens correction for the HUD and cursor, including transparent edges in both eyes.
+
+Run `tools/test-audio-output` to check that the headset audio check answers
+within half a second without blocking the main thread, for both a running and
+a missing output.
 
 Run `tools/test-shader-speedups` to check the shader's shortcuts on the GPU:
 the polynomial `atan2`/`asin` against double precision, and the HUD's

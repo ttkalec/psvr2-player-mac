@@ -616,6 +616,35 @@ struct Uniforms {
 
 // MARK: - Video
 
+// Whether an audio output actually runs: start it with a no-op IO proc. A
+// working device calls it within milliseconds; a wedged one blocks inside
+// AudioDeviceStart for seconds, so that runs on its own queue and the answer
+// comes after at most half a second. The completion runs on the main queue.
+enum AudioOutputCheck {
+    static func run(device: AudioDeviceID, completion: @escaping (Bool) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let delivered = DispatchSemaphore(value: 0)
+            let decided = DispatchSemaphore(value: 0)
+            var proc: AudioDeviceIOProcID?
+            guard AudioDeviceCreateIOProcIDWithBlock(&proc, device, nil, { _, _, _, _, _ in
+                delivered.signal()
+            }) == noErr, let proc else {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).async {
+                let responding = delivered.wait(timeout: .now() + 0.5) == .success
+                DispatchQueue.main.async { completion(responding) }
+                decided.signal()
+            }
+            AudioDeviceStart(device, proc)
+            decided.wait()
+            AudioDeviceStop(device, proc)
+            AudioDeviceDestroyIOProcID(device, proc)
+        }
+    }
+}
+
 final class VideoSource {
     let player: AVPlayer
     let nasAsset: NASVideoAsset?
@@ -875,10 +904,26 @@ final class VideoSource {
                 let uidErr = withUnsafeMutablePointer(to: &uid) { ptr -> OSStatus in
                     AudioObjectGetPropertyData(id, &uidAddr, 0, nil, &uidSize, ptr)
                 }
-                if uidErr == noErr {
-                    player.audioOutputDeviceUniqueID = uid as String
-                    audioDeviceID = id
-                    print("[audio] Audio routed to headset: \(name)")
+                guard uidErr == noErr else { return }
+                // The headset's DisplayPort audio can wedge (seen after
+                // display reconfigurations): starting it then blocks for ~10 s
+                // and fails, and AVPlayer stalls the main run loop with it
+                // while the video never advances. Route only once the device
+                // delivers audio. Waking DisplayPort audio takes ~0.35 s, so
+                // stay muted until then rather than start on the Mac's output.
+                player.isMuted = true
+                AudioOutputCheck.run(device: id) { [weak self] responding in
+                    guard let self else { return }
+                    self.player.isMuted = false
+                    if responding {
+                        self.player.audioOutputDeviceUniqueID = uid as String
+                        self.audioDeviceID = id
+                        print("[audio] Audio routed to headset: \(name)")
+                    } else {
+                        print("[audio] !!! \(name) output is not responding; playing through the Mac's "
+                            + "output. Unplug and reconnect the headset to restore headset audio")
+                        self.onUnsupported?("Headset audio is not responding — playing through the Mac. Reconnect the headset to fix it")
+                    }
                 }
                 return
             }
@@ -2095,8 +2140,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as! NSNumber
         let displayID = CGDirectDisplayID(truncating: screenNumber)
         headsetDisplayID = displayID
+        let backingWidth = Int(screen.frame.width * screen.backingScaleFactor)
+        let backingHeight = Int(screen.frame.height * screen.backingScaleFactor)
         print("[display] Render target: \(Int(view.drawableSize.width))x\(Int(view.drawableSize.height)), "
-            + "desktop backing: \(Int(screen.frame.width * screen.backingScaleFactor))x\(Int(screen.frame.height * screen.backingScaleFactor))")
+            + "desktop backing: \(backingWidth)x\(backingHeight)")
+        // A scaled desktop makes WindowServer composite a larger framebuffer
+        // every refresh and resample the lens-corrected image twice. The
+        // player does not switch modes itself: display reconfigurations can
+        // wedge the headset's DisplayPort audio until it is reconnected.
+        if vrScreen != nil, backingWidth != 4000 || backingHeight != 2040 {
+            print("[display] Headset desktop is scaled. For a sharper image and less GPU load, "
+                + "pick 2000x1020 or 4000x2040 for PS VR2 in Displays settings")
+        }
         if let mode = CGDisplayCopyDisplayMode(displayID) {
             print("[display] Headset display refresh rate per CoreGraphics: \(mode.refreshRate) Hz, "
                 + "screen maxFPS: \(screen.maximumFramesPerSecond)")
@@ -2516,10 +2571,6 @@ if isatty(STDOUT_FILENO) == 0 {
 let args = CommandLine.arguments
 // With no argument, the file is chosen via the in-headset panel after launch
 let url: URL? = args.count > 1 ? URL(fileURLWithPath: args[1]) : nil
-
-// Before AppKit reads the screen layout, so the headset window is created
-// on the final desktop size
-HeadsetDisplayMode.useNativePixels()
 
 let app = PlayerApplication.shared
 app.setActivationPolicy(.regular)

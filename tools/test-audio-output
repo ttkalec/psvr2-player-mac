@@ -1,0 +1,19 @@
+#!/bin/zsh
+set -eu
+root=${0:A:h:h}
+test_dir=$(mktemp -d /private/tmp/psvr2-audio-output.XXXXXX)
+trap 'rm -rf "$test_dir"' EXIT
+# Compile production types without the application's launch/logging block.
+sed '/^\/\/ MARK: - Startup/,$d' "$root/player/main.swift" > "$test_dir/PlayerTypes.swift"
+cat "$root/player/cpsvr2.h" > "$test_dir/TestBridge.h"
+echo 'int test_prediction_count(void);' >> "$test_dir/TestBridge.h"
+clang -O2 -I"$root/player" -c "$root/tools/rendering-headset-stub.c" -o "$test_dir/headset.o"
+clang -O2 -c "$root/player/lut.c" -o "$test_dir/lut.o"
+swiftc -O -module-cache-path "$test_dir/cache" -import-objc-header "$test_dir/TestBridge.h" \
+    "$test_dir/PlayerTypes.swift" "$root/tools/audio-output-tests.swift" \
+    "$root/player/overlay.swift" "$root/player/files.swift" "$root/player/rendering.swift" \
+    "$root/player/sweeper.swift" "$root/player/meta.swift" "$root/player/passthrough.swift" \
+    "$root/player/nas.swift" "$root/player/seeking.swift" "$test_dir/headset.o" "$test_dir/lut.o" \
+    -framework AppKit -framework Metal -framework MetalKit -framework AVFoundation \
+    -framework CoreAudio -framework CoreVideo -o "$test_dir/tests"
+"$test_dir/tests" "$@"
